@@ -2,7 +2,7 @@
 
 #==============================================================================
 # The Ubuntu Basic Setup Script (TUBSS)
-# Version: 0.5
+# Version: 0.6
 # Author: OrangeZef
 #
 # This script automates the initial setup and hardening of a new Ubuntu server.
@@ -166,6 +166,15 @@ if [ -z "$ORIGINAL_IP" ]; then
     ORIGINAL_IP=$(ip -o -4 a | awk '{print $4}' | grep -v 'lo' | head -n 1)
     ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
     ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
+fi
+
+# FIX: Add a new variable to detect the original network type (DHCP or static)
+if grep -q "dhcp4: true" /etc/netplan/* &>/dev/null; then
+    ORIGINAL_NET_TYPE="dhcp"
+elif grep -q "dhcp4: false" /etc/netplan/* &>/dev/null; then
+    ORIGINAL_NET_TYPE="static"
+else
+    ORIGINAL_NET_TYPE="unknown"
 fi
 
 ORIGINAL_HOSTNAME=$(hostname)
@@ -376,7 +385,7 @@ echo -e "$SUMMARY_ART"
 printf "%-30b | %-20s | %-20s\n" "Setting" "Original Value" "New Value"
 printf "%-30s | %-20s | %-20s\n" "------------------------------" "--------------------" "--------------------"
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}Hostname:${NC}" "${ORIGINAL_HOSTNAME}" "${HOSTNAME}"
-printf "%-30b | %-20s | %-20s\n" "${YELLOW}Network Type:${NC}" "N/A" "${NET_TYPE}"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Network Type:${NC}" "${ORIGINAL_NET_TYPE}" "${NET_TYPE}"
 if [[ "$NET_TYPE" == "static" ]]; then
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}IP Address:${NC}" "${ORIGINAL_IP:-N/A}" "${STATIC_IP}/${NETMASK}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Gateway:${NC}" "${ORIGINAL_GATEWAY:-N/A}" "${GATEWAY}"
@@ -389,9 +398,9 @@ printf "%-30b | %-20s | %-20s\n" "${YELLOW}Auto Updates Status:${NC}" "${ORIGINA
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}Fail2ban Status:${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "$(if [ "$INSTALL_FAIL2BAN" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "$(if [ "$DISABLE_TELEMETRY" == "yes" ]; then echo "To be Disabled"; else echo "Skipped"; fi)"
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}AD Domain Join:${NC}" "${ORIGINAL_DOMAIN_STATUS:-Not Joined}" "$(if [ "$JOIN_DOMAIN" == "yes" ]; then echo "To be Joined"; else echo "Skipped"; fi)"
-printf "%-30b | %-20s | %-20s\n" "${YELLOW}NFS Client Status:${NC}" "${ORIGINAL_NFS_STATUS}" "$(if [ "$INSTALL_NFS" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
-printf "%-30b | %-20s | %-20s\n" "${YELLOW}SMB Client Status:${NC}" "${ORIGINAL_SMB_STATUS}" "$(if [ "$INSTALL_SMB" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
-printf "%-30b | %-20s | %-20s\n" "${YELLOW}Git Status:${NC}" "${ORIGINAL_GIT_STATUS}" "$(if [ "$INSTALL_GIT" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}NFS Client Status:${NC}" "${ORIGINAL_NFS_STATUS}" "$(if [[ "$INSTALL_NFS" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}SMB Client Status:${NC}" "${ORIGINAL_SMB_STATUS}" "$(if [[ "$INSTALL_SMB" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Git Status:${NC}" "${ORIGINAL_GIT_STATUS}" "$(if [[ "$INSTALL_GIT" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)"
 echo -e "--------------------------------------------------------"
 
 read -p "Does the above configuration look correct? (yes/no) [yes]: " CONFIRM_EXECUTION
@@ -609,7 +618,7 @@ Setting                      | Original Value             | New Value
 -----------------------------|----------------------------|----------------------------
 Hostname                     | $ORIGINAL_HOSTNAME           | $HOSTNAME
 Filesystem Snapshot          | N/A                        | $SNAPSHOT_STATUS
-Network Type                 | N/A                        | $NET_TYPE
+Network Type                 | $ORIGINAL_NET_TYPE           | $NET_TYPE
 IP Address                   | ${ORIGINAL_IP:-N/A}        | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$STATIC_IP/$NETMASK"; else echo "N/A"; fi)
 Gateway                      | ${ORIGINAL_GATEWAY:-N/A}   | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$GATEWAY"; else echo "N/A"; fi)
 DNS Server                   | ${ORIGINAL_DNS:-N/A}       | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$DNS_SERVER"; else echo "N/A"; fi)
