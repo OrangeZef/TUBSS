@@ -2,17 +2,16 @@
 
 #==============================================================================
 # The Ubuntu Basic Setup Script (TUBSS)
-# Version: 1.1
+# Version: 2.0
 # Author: OrangeZef
 #
 # This script automates the initial setup and hardening of a new Ubuntu server.
 #
 # Changelog:
-# - Added robust input validation to prevent command injection.
-# - Refactored script into modular functions for better readability and maintenance.
-# - Improved error handling and exit traps.
-# - Ensured all function variables are declared as local.
-# - Simplified summary generation logic for increased reliability.
+# - Improved disk usage retrieval to prevent "DF: No file system processed" errors.
+# - Added a visual progress spinner for all long-running commands (e.g., package installation)
+#   to indicate that the script is actively running and not hung.
+# - Maintained all previous security and robustness optimizations.
 #
 # Features:
 # - Automated Security (UFW, Fail2ban)
@@ -38,6 +37,7 @@ BANNER_ART="
 |    T U B S S                                |
 +---------------------------------------------+
 |    The Ubuntu Basic Setup Script            |
+|    Version 2.0                              |
 +---------------------------------------------+
 |    Provided by Joka.ca                      |
 +---------------------------------------------+
@@ -61,15 +61,15 @@ CLOSING_ART="
  __________________________________________________________________
 < Thank you for using TUBSS - The Ubuntu Basic Setup Script! >
  ------------------------------------------------------------------
-          \     
-           \    .--.
-            \  ( o  o)
-             >  )  (
-           /    '--'
-          (____)__
-            /  /
-           /  /
-          /  /
+     \     
+       \    .--.
+        \  ( o  o)
+         >  )  (
+       /    '--'
+        (____)__
+         /  /
+         /  /
+         /  /
        /\\_//\\
       (oo) (oo)
       / |  | \\
@@ -178,7 +178,7 @@ main() {
 
 # --- Step 1: System Prereqs and Info ---
 run_prereqs() {
-    local original_user_home original_user
+    local original_user_home original_user disk_usage_output
 
     # Get the original user's desktop path for the summary file
     original_user=$(logname)
@@ -231,7 +231,15 @@ run_prereqs() {
     echo -e "${YELLOW}IP Address(es):     ${NC}$(ip -o -4 a | awk '{print $2, $4}' | grep -v 'lo' | sed 's/ /\t/g')"
     echo -e "${YELLOW}CPU:                ${NC}$(lscpu | grep 'Model name:' | sed 's/Model name://' | awk '{$1=$1}1')"
     echo -e "${YELLOW}Memory:             ${NC}$(free -h | grep 'Mem:' | awk '{print $2}')"
-    echo -e "${YELLOW}Disk Usage (/):     ${NC}$(df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 " used)"}')"
+    
+    # Store disk usage in a variable and check for success
+    disk_usage_output=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 "/" $2 " (" $5 " used)"}')
+    if [[ -z "$disk_usage_output" ]]; then
+        echo -e "${YELLOW}Disk Usage (/):     ${NC}Failed to retrieve disk usage.${NC}"
+    else
+        echo -e "${YELLOW}Disk Usage (/):     ${NC}${disk_usage_output}"
+    fi
+
     echo -e "--------------------------------------------------------"
     read -p "Press Enter to begin the configuration..."
 }
@@ -562,7 +570,8 @@ configure_hostname() {
 install_packages() {
     local packages_to_install
     echo -ne "${YELLOW}[TUBSS] Updating package lists...${NC}"
-    apt-get update -y > /dev/null 2>&1 & spinner $! "Updating package lists"
+    apt-get update -y > /dev/null 2>&1 &
+    spinner $! "Updating package lists"
     echo -e "${GREEN}[OK]${NC} Package lists updated."
 
     packages_to_install="curl ufw unattended-upgrades apparmor net-tools htop neofetch vim build-essential rsync"
@@ -575,7 +584,8 @@ install_packages() {
 
     if [ -n "$packages_to_install" ]; then
         echo -ne "${YELLOW}[TUBSS] Installing packages...${NC}"
-        apt-get install -y $packages_to_install > /dev/null 2>&1 & spinner $! "Installing packages"
+        apt-get install -y $packages_to_install > /dev/null 2>&1 &
+        spinner $! "Installing packages"
         echo -e "${GREEN}[OK]${NC} All selected packages installed successfully."
     fi
 }
