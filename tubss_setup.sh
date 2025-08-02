@@ -2,7 +2,7 @@
 
 #==============================================================================
 # The Ubuntu Basic Setup Script (TUBSS)
-# Version: 0.6
+# Version: 0.7
 # Author: OrangeZef
 #
 # This script automates the initial setup and hardening of a new Ubuntu server.
@@ -28,7 +28,7 @@ BANNER_ART="
   _   _   _   _   _   _   _   _   _   _   _   _   _   _   _ 
  / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ 
 ( T | U | B | S | S |   | S | e | t | u | p |   | S | c | r |
- \_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ 
+ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ 
   _   _   _   _   _   _   _   _   _   _   _   _   _   _   _ 
  / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ 
 ( i | p | t |   | T | o | o | l | s |   | B | a | s | i | c |
@@ -113,6 +113,21 @@ spinner() {
     printf "\b \n"
 }
 
+# Function to convert CIDR prefix to a dotted-decimal subnet mask
+cidr2mask() {
+    local cidr=$1
+    local i
+    local mask=""
+    for i in {1..4}; do
+        local val=$(( ( (cidr > 8) ? 255 : (256 - 2**(8-cidr)) ) ))
+        mask+="$val."
+        cidr=$(( cidr-8 ))
+        if (( cidr < 0 )); then cidr=0; fi
+    done
+    echo "${mask%.}"
+}
+
+
 # Cleanup function to be executed on script exit
 cleanup() {
     echo ""
@@ -156,19 +171,25 @@ fi
 SUMMARY_FILE="$DESKTOP_DIR/tubss_configuration_summary_$(date +%Y%m%d_%H%M%S).txt"
 
 # --- Capture Before Values ---
-# FIX: Use a more reliable way to get the primary IP, gateway, and interface.
+# Use a more reliable way to get the primary IP, gateway, and interface.
 NETWORK_INFO=$(ip route get 8.8.8.8)
-ORIGINAL_IP=$(echo "$NETWORK_INFO" | awk '{print $7}')
+ORIGINAL_IP_CIDR=$(echo "$NETWORK_INFO" | awk '{print $7}')
+ORIGINAL_IP=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f1)
+ORIGINAL_NETMASK_CIDR=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f2)
+ORIGINAL_NETMASK=$(cidr2mask "$ORIGINAL_NETMASK_CIDR")
 ORIGINAL_GATEWAY=$(echo "$NETWORK_INFO" | awk '{print $3}')
 ORIGINAL_INTERFACE=$(echo "$NETWORK_INFO" | awk '{print $5}')
 # If for some reason the above command fails, fall back to a less reliable method
 if [ -z "$ORIGINAL_IP" ]; then
-    ORIGINAL_IP=$(ip -o -4 a | awk '{print $4}' | grep -v 'lo' | head -n 1)
+    ORIGINAL_IP_CIDR=$(ip -o -4 a | awk '{print $4}' | grep -v 'lo' | head -n 1)
+    ORIGINAL_IP=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f1)
+    ORIGINAL_NETMASK_CIDR=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f2)
+    ORIGINAL_NETMASK=$(cidr2mask "$ORIGINAL_NETMASK_CIDR")
     ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
     ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
 fi
 
-# FIX: Add a new variable to detect the original network type (DHCP or static)
+# Add a new variable to detect the original network type (DHCP or static)
 if grep -q "dhcp4: true" /etc/netplan/* &>/dev/null; then
     ORIGINAL_NET_TYPE="dhcp"
 elif grep -q "dhcp4: false" /etc/netplan/* &>/dev/null; then
@@ -204,9 +225,9 @@ read -p "Press Enter to begin the configuration..."
 
 # --- Initial Prompt for Defaults ---
 echo ""
-read -p "Do you want to use all default settings for the configuration? (yes/no) [yes]: " USE_DEFAULTS
-USE_DEFAULTS=${USE_DEFAULTS:-yes}
-USE_DEFAULTS=$(echo "$USE_DEFAULTS" | tr '[:upper:]' '[:lower:]')
+read -p "Would you like to use the default configuration or manually configure each option? (default/manual) [default]: " CONFIG_CHOICE
+CONFIG_CHOICE=${CONFIG_CHOICE:-default}
+CONFIG_CHOICE=$(echo "$CONFIG_CHOICE" | tr '[:upper:]' '[:lower:]')
 
 # --- User Configuration Prompts ---
 echo -e "${YELLOW}--------------------------------------------------------${NC}"
@@ -220,7 +241,7 @@ CREATE_SNAPSHOT="no" # Default to no
 # Check if Timeshift is installed first, then ZFS/Btrfs
 if command -v timeshift &> /dev/null; then
     echo -e "${YELLOW}Timeshift snapshot utility detected.${NC}"
-    if [[ "$USE_DEFAULTS" == "yes" ]]; then
+    if [[ "$CONFIG_CHOICE" == "default" ]]; then
         CREATE_SNAPSHOT="yes"
     else
         read -p "Do you want to create a Timeshift snapshot? (yes/no) [yes]: " CREATE_SNAPSHOT
@@ -231,7 +252,7 @@ elif command -v zfs &> /dev/null; then
     ZFS_ROOT_DATASET=$(zfs list -o name,mountpoint -t filesystem | grep " /$" | awk '{print $1}')
     if [ -n "$ZFS_ROOT_DATASET" ]; then
         echo -e "${YELLOW}ZFS root filesystem detected: ${ZFS_ROOT_DATASET}${NC}"
-        if [[ "$USE_DEFAULTS" == "yes" ]]; then
+        if [[ "$CONFIG_CHOICE" == "default" ]]; then
             CREATE_SNAPSHOT="yes"
         else
             read -p "Do you want to create a ZFS snapshot for rollback? (yes/no) [yes]: " CREATE_SNAPSHOT
@@ -244,7 +265,7 @@ elif command -v zfs &> /dev/null; then
 elif command -v btrfs &> /dev/null; then
     if [ -n "$(df -t btrfs / | grep -q ' /$' && echo 'found')" ]; then
         echo -e "${YELLOW}Btrfs root filesystem detected.${NC}"
-        if [[ "$USE_DEFAULTS" == "yes" ]]; then
+        if [[ "$CONFIG_CHOICE" == "default" ]]; then
             CREATE_SNAPSHOT="yes"
         else
             read -p "Do you want to create a Btrfs snapshot for rollback? (yes/no) [yes]: " CREATE_SNAPSHOT
@@ -259,7 +280,7 @@ else
 fi
 
 # Hostname
-if [[ "$USE_DEFAULTS" == "yes" ]]; then
+if [[ "$CONFIG_CHOICE" == "default" ]]; then
     HOSTNAME="$ORIGINAL_HOSTNAME"
 else
     read -p "Enter the desired hostname for this machine [$ORIGINAL_HOSTNAME]: " HOSTNAME
@@ -267,7 +288,7 @@ else
 fi
 
 # Network Configuration
-if [[ "$USE_DEFAULTS" == "yes" ]]; then
+if [[ "$CONFIG_CHOICE" == "default" ]]; then
     NET_TYPE="dhcp"
 else
     read -p "Do you want to use DHCP or a static IP? (dhcp/static) [dhcp]: " NET_TYPE
@@ -278,9 +299,9 @@ fi
 # Static IP specific prompts
 if [[ "$NET_TYPE" == "static" ]]; then
     INTERFACE_NAME=$(echo "$NETWORK_INFO" | awk '{print $5}')
-    if [[ "$USE_DEFAULTS" == "yes" ]]; then
+    if [[ "$CONFIG_CHOICE" == "default" ]]; then
         STATIC_IP="192.168.1.100" # A common but generic default
-        NETMASK="24"
+        NETMASK_CIDR="24"
         GATEWAY="192.168.1.1"
         DNS_SERVER="8.8.8.8"
         if [ -n "$INTERFACE_NAME" ]; then
@@ -290,7 +311,7 @@ if [[ "$NET_TYPE" == "static" ]]; then
             DEFAULT_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
             DEFAULT_DNS=$(resolvectl status "$INTERFACE_NAME" | grep 'DNS Servers' | awk '{print $3}' | head -n 1)
             STATIC_IP="$DEFAULT_IP"
-            NETMASK="$DEFAULT_NETMASK_CIDR"
+            NETMASK_CIDR="$DEFAULT_NETMASK_CIDR"
             GATEWAY="$DEFAULT_GATEWAY"
             DNS_SERVER="$DEFAULT_DNS"
         fi
@@ -309,15 +330,18 @@ if [[ "$NET_TYPE" == "static" ]]; then
                 echo "Error: Interface '$INTERFACE_NAME' not found. Please enter a valid interface name."
             fi
         done
-        read -p "Enter the static IP address (e.g., ${ORIGINAL_IP%/*}): " STATIC_IP
-        read -p "Enter the network mask (e.g., ${ORIGINAL_IP#*/}): " NETMASK
-        read -p "Enter the gateway IP address (e.g., $ORIGINAL_GATEWAY): " GATEWAY
-        read -p "Enter the DNS server IP address (e.g., $ORIGINAL_DNS): " DNS_SERVER
+        read -p "Enter the static IP address (e.g., ${ORIGINAL_IP}): " STATIC_IP
+        read -p "Enter the network mask (e.g., ${ORIGINAL_NETMASK}) [${ORIGINAL_NETMASK}]: " NETMASK
+        NETMASK=${NETMASK:-$ORIGINAL_NETMASK}
+        read -p "Enter the gateway IP address (e.g., $ORIGINAL_GATEWAY) [$ORIGINAL_GATEWAY]: " GATEWAY
+        GATEWAY=${GATEWAY:-$ORIGINAL_GATEWAY}
+        read -p "Enter the DNS server IP address (e.g., $ORIGINAL_DNS) [$ORIGINAL_DNS]: " DNS_SERVER
+        DNS_SERVER=${DNS_SERVER:-$ORIGINAL_DNS}
     fi
 fi
 
 # Service and Security Prompts
-if [[ "$USE_DEFAULTS" == "yes" ]]; then
+if [[ "$CONFIG_CHOICE" == "default" ]]; then
     INSTALL_WEBMIN="no"
     ENABLE_UFW="yes"
     ENABLE_AUTO_UPDATES="yes"
@@ -381,7 +405,7 @@ fi
 # --- Pre-Execution Configuration Review ---
 echo ""
 echo -e "$SUMMARY_ART"
-# FIX: Use %-30b to enable color interpretation in printf
+# Use %-30b to enable color interpretation in printf
 printf "%-30b | %-20s | %-20s\n" "Setting" "Original Value" "New Value"
 printf "%-30s | %-20s | %-20s\n" "------------------------------" "--------------------" "--------------------"
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}Hostname:${NC}" "${ORIGINAL_HOSTNAME}" "${HOSTNAME}"
@@ -492,7 +516,7 @@ network:
   ethernets:
     $INTERFACE_NAME:
       dhcp4: false
-      addresses: [$STATIC_IP/$NETMASK]
+      addresses: [$STATIC_IP/$ORIGINAL_NETMASK_CIDR]
       routes:
         - to: default
           via: $GATEWAY
@@ -573,7 +597,7 @@ fi
 if [[ "$DISABLE_TELEMETRY" == "yes" ]]; then
     echo -ne "${YELLOW}[TUBSS] Disabling Ubuntu Telemetry... ${NC}"
     if [ -f /etc/ubuntu-report/ubuntu-report.conf ]; then
-        sed -i 's/^enable = true/enable = false/' /etc/ubuntu-report/ubuntu-report.conf
+        sed -i 's/^enable = true/enable = false/' etc/ubuntu-report/ubuntu-report.conf
         NEW_TELEMETRY_STATUS="Disabled"
         echo -e "${GREEN}[OK]${NC} Ubuntu telemetry disabled."
     else
@@ -619,14 +643,14 @@ Setting                      | Original Value             | New Value
 Hostname                     | $ORIGINAL_HOSTNAME           | $HOSTNAME
 Filesystem Snapshot          | N/A                        | $SNAPSHOT_STATUS
 Network Type                 | $ORIGINAL_NET_TYPE           | $NET_TYPE
-IP Address                   | ${ORIGINAL_IP:-N/A}        | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$STATIC_IP/$NETMASK"; else echo "N/A"; fi)
+IP Address                   | ${ORIGINAL_IP:-N/A}        | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$STATIC_IP/$ORIGINAL_NETMASK_CIDR"; else echo "N/A"; fi)
 Gateway                      | ${ORIGINAL_GATEWAY:-N/A}   | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$GATEWAY"; else echo "N/A"; fi)
 DNS Server                   | ${ORIGINAL_DNS:-N/A}       | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$DNS_SERVER"; else echo "N/A"; fi)
 Webmin Status                | $ORIGINAL_WEBMIN_STATUS    | $(if [[ "$INSTALL_WEBMIN" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)
 UFW Status                   | $ORIGINAL_UFW_STATUS       | $NEW_UFW_STATUS
-Auto Updates Status          | $ORIGINAL_AUTO_UPDATES_STATUS | $NEW_AUTO_UPDATES_STATUS
+Auto Updates Status          | $ORIGINAL_AUTO_UPDATES_STATUS | $(if [[ "$ENABLE_AUTO_UPDATES" == "yes" ]]; then echo "To be Enabled"; else echo "Skipped"; fi)
 Fail2ban Status              | $ORIGINAL_FAIL2BAN_STATUS  | $NEW_FAIL2BAN_STATUS
-Telemetry/Analytics          | $ORIGINAL_TELEMETRY_STATUS | $NEW_TELEMETRY_STATUS
+Telemetry/Analytics          | $ORIGINAL_TELEMETRY_STATUS | $(if [[ "$DISABLE_TELEMETRY" == "yes" ]]; then echo "To be Disabled"; else echo "Skipped"; fi)
 AD Domain Join               | ${ORIGINAL_DOMAIN_STATUS:-Not Joined} | $NEW_DOMAIN_STATUS
 NFS Client Status            | $ORIGINAL_NFS_STATUS       | $(if [[ "$INSTALL_NFS" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)
 SMB Client Status            | $ORIGINAL_SMB_STATUS       | $(if [[ "$INSTALL_SMB" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)
