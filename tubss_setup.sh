@@ -2,7 +2,7 @@
 
 #==============================================================================
 # The Ubuntu Basic Setup Script (TUBSS)
-# Version: 0.7
+# Version: 1.0
 # Author: OrangeZef
 #
 # This script automates the initial setup and hardening of a new Ubuntu server.
@@ -14,6 +14,8 @@
 # - Automatic Security Updates
 # - Telemetry Disablement
 # - Summary of proposed changes and final report
+#
+# Provided by Joka.ca
 #==============================================================================
 
 # --- Global Variables & Colors ---
@@ -25,18 +27,13 @@ NC='\033[0m' # No Color
 
 # Define ANSI art for headers
 BANNER_ART="
-  _   _   _   _   _   _   _   _   _   _   _   _   _   _   _ 
- / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ 
-( T | U | B | S | S |   | S | e | t | u | p |   | S | c | r |
- \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ 
-  _   _   _   _   _   _   _   _   _   _   _   _   _   _   _ 
- / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ / \ 
-( i | p | t |   | T | o | o | l | s |   | B | a | s | i | c |
- \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/
-  _   _   _   _   _   _   _
- / \ / \ / \ / \ / \ / \ / \ 
-( S | e | c | u | r | e )
- \\_/ \\_/ \\_/ \\_/ \\_/ \\_/ \\_/
++---------------------------------------------+
+|    T U B S S                                |
++---------------------------------------------+
+|    The Ubuntu Basic Setup Script            |
++---------------------------------------------+
+|    Provided by Joka.ca                      |
++---------------------------------------------+
 "
 INFO_ART="
 ============================================================
@@ -57,11 +54,21 @@ CLOSING_ART="
  __________________________________________________________________
 < Thank you for using TUBSS - The Ubuntu Basic Setup Script! >
  ------------------------------------------------------------------
-        \   ^__^
-         \  (oo)\_______
-            (__)\       )\/\
-                ||----w |
-                ||     ||
+          \     
+           \    .--.
+            \  ( o  o)
+             >  )  (
+           /    '--'
+          (____)__
+            /  /
+           /  /
+          /  /
+       /\\_//\\
+      (oo) (oo)
+      / |  | \\
+     |  |  |  |
+     \\_/_ \\_/_/
+        \_/
 "
 
 # Exit immediately if a command exits with a non-zero status.
@@ -118,6 +125,10 @@ cidr2mask() {
     local cidr=$1
     local i
     local mask=""
+    if ! [[ "$cidr" =~ ^[0-9]+$ ]]; then
+        echo "255.255.255.0"
+        return
+    fi
     for i in {1..4}; do
         local val=$(( ( (cidr > 8) ? 255 : (256 - 2**(8-cidr)) ) ))
         mask+="$val."
@@ -152,7 +163,6 @@ clear
 
 # Display banner art and system info
 echo -e "$BANNER_ART"
-echo -e "${YELLOW}Provided by Joka.ca${NC}"
 echo -e "--------------------------------------------------------"
 
 # Check for root privileges
@@ -172,22 +182,19 @@ SUMMARY_FILE="$DESKTOP_DIR/tubss_configuration_summary_$(date +%Y%m%d_%H%M%S).tx
 
 # --- Capture Before Values ---
 # Use a more reliable way to get the primary IP, gateway, and interface.
-NETWORK_INFO=$(ip route get 8.8.8.8)
-ORIGINAL_IP_CIDR=$(echo "$NETWORK_INFO" | awk '{print $7}')
-ORIGINAL_IP=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f1)
-ORIGINAL_NETMASK_CIDR=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f2)
-ORIGINAL_NETMASK=$(cidr2mask "$ORIGINAL_NETMASK_CIDR")
-ORIGINAL_GATEWAY=$(echo "$NETWORK_INFO" | awk '{print $3}')
-ORIGINAL_INTERFACE=$(echo "$NETWORK_INFO" | awk '{print $5}')
-# If for some reason the above command fails, fall back to a less reliable method
-if [ -z "$ORIGINAL_IP" ]; then
-    ORIGINAL_IP_CIDR=$(ip -o -4 a | awk '{print $4}' | grep -v 'lo' | head -n 1)
+ORIGINAL_IP_CIDR=$(ip -o -4 a | awk '{print $4}' | grep -v 'lo' | head -n 1)
+if [[ "$ORIGINAL_IP_CIDR" =~ "/" ]]; then
     ORIGINAL_IP=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f1)
     ORIGINAL_NETMASK_CIDR=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f2)
     ORIGINAL_NETMASK=$(cidr2mask "$ORIGINAL_NETMASK_CIDR")
-    ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
-    ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
+else
+    # Fallback if no CIDR is found
+    ORIGINAL_IP=$ORIGINAL_IP_CIDR
+    ORIGINAL_NETMASK_CIDR="24" # A safe default
+    ORIGINAL_NETMASK="255.255.255.0"
 fi
+ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
+ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
 
 # Add a new variable to detect the original network type (DHCP or static)
 if grep -q "dhcp4: true" /etc/netplan/* &>/dev/null; then
@@ -298,23 +305,11 @@ fi
 
 # Static IP specific prompts
 if [[ "$NET_TYPE" == "static" ]]; then
-    INTERFACE_NAME=$(echo "$NETWORK_INFO" | awk '{print $5}')
     if [[ "$CONFIG_CHOICE" == "default" ]]; then
         STATIC_IP="192.168.1.100" # A common but generic default
         NETMASK_CIDR="24"
         GATEWAY="192.168.1.1"
         DNS_SERVER="8.8.8.8"
-        if [ -n "$INTERFACE_NAME" ]; then
-            DEFAULT_IP_CIDR=$(ip -o -4 a | grep -v 'lo' | awk '{print $2, $4}' | grep "$INTERFACE_NAME" | awk '{print $2}' | head -n 1)
-            DEFAULT_IP=$(echo "$DEFAULT_IP_CIDR" | cut -d/ -f1)
-            DEFAULT_NETMASK_CIDR=$(echo "$DEFAULT_IP_CIDR" | cut -d/ -f2)
-            DEFAULT_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
-            DEFAULT_DNS=$(resolvectl status "$INTERFACE_NAME" | grep 'DNS Servers' | awk '{print $3}' | head -n 1)
-            STATIC_IP="$DEFAULT_IP"
-            NETMASK_CIDR="$DEFAULT_NETMASK_CIDR"
-            GATEWAY="$DEFAULT_GATEWAY"
-            DNS_SERVER="$DEFAULT_DNS"
-        fi
     else
         echo ""
         echo "Please provide the network interface name for the static IP configuration."
@@ -331,8 +326,8 @@ if [[ "$NET_TYPE" == "static" ]]; then
             fi
         done
         read -p "Enter the static IP address (e.g., ${ORIGINAL_IP}): " STATIC_IP
-        read -p "Enter the network mask (e.g., ${ORIGINAL_NETMASK}) [${ORIGINAL_NETMASK}]: " NETMASK
-        NETMASK=${NETMASK:-$ORIGINAL_NETMASK}
+        read -p "Enter the network mask (CIDR notation, e.g., 24) [${ORIGINAL_NETMASK_CIDR}]: " NETMASK_CIDR
+        NETMASK_CIDR=${NETMASK_CIDR:-$ORIGINAL_NETMASK_CIDR}
         read -p "Enter the gateway IP address (e.g., $ORIGINAL_GATEWAY) [$ORIGINAL_GATEWAY]: " GATEWAY
         GATEWAY=${GATEWAY:-$ORIGINAL_GATEWAY}
         read -p "Enter the DNS server IP address (e.g., $ORIGINAL_DNS) [$ORIGINAL_DNS]: " DNS_SERVER
@@ -411,7 +406,7 @@ printf "%-30s | %-20s | %-20s\n" "------------------------------" "-------------
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}Hostname:${NC}" "${ORIGINAL_HOSTNAME}" "${HOSTNAME}"
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}Network Type:${NC}" "${ORIGINAL_NET_TYPE}" "${NET_TYPE}"
 if [[ "$NET_TYPE" == "static" ]]; then
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}IP Address:${NC}" "${ORIGINAL_IP:-N/A}" "${STATIC_IP}/${NETMASK}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}IP Address:${NC}" "${ORIGINAL_IP:-N/A}" "${STATIC_IP}/${NETMASK_CIDR}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Gateway:${NC}" "${ORIGINAL_GATEWAY:-N/A}" "${GATEWAY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}DNS Server:${NC}" "${ORIGINAL_DNS:-N/A}" "${DNS_SERVER}"
 fi
@@ -424,7 +419,7 @@ printf "%-30b | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINA
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}AD Domain Join:${NC}" "${ORIGINAL_DOMAIN_STATUS:-Not Joined}" "$(if [ "$JOIN_DOMAIN" == "yes" ]; then echo "To be Joined"; else echo "Skipped"; fi)"
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}NFS Client Status:${NC}" "${ORIGINAL_NFS_STATUS}" "$(if [[ "$INSTALL_NFS" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)"
 printf "%-30b | %-20s | %-20s\n" "${YELLOW}SMB Client Status:${NC}" "${ORIGINAL_SMB_STATUS}" "$(if [[ "$INSTALL_SMB" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)"
-printf "%-30b | %-20s | %-20s\n" "${YELLOW}Git Status:${NC}" "${ORIGINAL_GIT_STATUS}" "$(if [[ "$INSTALL_GIT" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Git Status:${NC}" "${ORIGINAL_GIT_STATUS}" "$(if [[ "$INSTALL_GIT" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
 echo -e "--------------------------------------------------------"
 
 read -p "Does the above configuration look correct? (yes/no) [yes]: " CONFIRM_EXECUTION
@@ -516,7 +511,7 @@ network:
   ethernets:
     $INTERFACE_NAME:
       dhcp4: false
-      addresses: [$STATIC_IP/$ORIGINAL_NETMASK_CIDR]
+      addresses: [$STATIC_IP/$NETMASK_CIDR]
       routes:
         - to: default
           via: $GATEWAY
@@ -632,6 +627,7 @@ echo ""
 # Write summary to file
 cat << EOF > "$SUMMARY_FILE"
 TUBSS - The Ubuntu Basic Setup Script - Configuration Summary
+Provided by Joka.ca
 
 Date: $(date)
 Hostname: $HOSTNAME
@@ -643,7 +639,7 @@ Setting                      | Original Value             | New Value
 Hostname                     | $ORIGINAL_HOSTNAME           | $HOSTNAME
 Filesystem Snapshot          | N/A                        | $SNAPSHOT_STATUS
 Network Type                 | $ORIGINAL_NET_TYPE           | $NET_TYPE
-IP Address                   | ${ORIGINAL_IP:-N/A}        | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$STATIC_IP/$ORIGINAL_NETMASK_CIDR"; else echo "N/A"; fi)
+IP Address                   | ${ORIGINAL_IP:-N/A}        | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$STATIC_IP/$NETMASK_CIDR"; else echo "N/A"; fi)
 Gateway                      | ${ORIGINAL_GATEWAY:-N/A}   | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$GATEWAY"; else echo "N/A"; fi)
 DNS Server                   | ${ORIGINAL_DNS:-N/A}       | $(if [[ "$NET_TYPE" == "static" ]]; then echo "$DNS_SERVER"; else echo "N/A"; fi)
 Webmin Status                | $ORIGINAL_WEBMIN_STATUS    | $(if [[ "$INSTALL_WEBMIN" == "yes" ]]; then echo "To be Installed"; else echo "Skipped"; fi)
