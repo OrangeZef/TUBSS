@@ -600,6 +600,11 @@ if [[ "$JOIN_DOMAIN" == "yes" ]]; then
     echo "$AD_PASSWORD" | realm join "$AD_DOMAIN" --user="$AD_USER" > /dev/null 2>&1 & spinner $! "Joining Active Directory"
     unset AD_PASSWORD
     echo -e "${GREEN}[OK]${NC} Domain join successful."
+
+    echo -ne "${YELLOW}[TUBSS] Enabling automatic home directory creation...${NC}"
+    pam-auth-update --enable mkhomedir > /dev/null 2>&1
+    echo -e "${GREEN}[OK]${NC} mkhomedir enabled."
+
     echo -ne "${YELLOW}[TUBSS] Configuring SSSD for AD integration...${NC}"
     cat <<EOF > "/etc/sssd/sssd.conf"
 [sssd]
@@ -618,12 +623,20 @@ krb5_auth_timeout = 5
 ldap_search_base = $(echo "$AD_DOMAIN" | sed 's/\./,dc=/g' | sed 's/^/dc=/')
 ldap_schema = ad
 ldap_uri = ldap://$AD_DOMAIN
+use_fully_qualified_names = False
 EOF
     chmod 600 /etc/sssd/sssd.conf
     systemctl restart sssd > /dev/null 2>&1
     systemctl enable sssd > /dev/null 2>&1
-    authselect select sssd with-mkhomedir --force > /dev/null 2>&1
     echo -e "${GREEN}[OK]${NC} SSSD configured."
+
+    echo -ne "${YELLOW}[TUBSS] Configuring sudo permissions for AD groups...${NC}"
+    cat <<EOF > /etc/sudoers.d/ad_admins
+%Domain\\ Admins ALL=(ALL:ALL) ALL
+%Linux\\ Admins ALL=(ALL:ALL) ALL
+EOF
+    chmod 440 /etc/sudoers.d/ad_admins
+    echo -e "${GREEN}[OK]${NC} Sudo permissions configured."
     NEW_DOMAIN_STATUS="Configured"
 else
     NEW_DOMAIN_STATUS="Skipped"
