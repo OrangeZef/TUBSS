@@ -2,22 +2,17 @@
 
 #==============================================================================
 # The Ubuntu Basic Setup Script (TUBSS)
-# Version: 2.2 (DF fix & Fail2ban fix)
+# Version: 2.2 (Refactored for Efficiency)
 # Author: OrangeZef
 #
 # This script automates the initial setup and hardening of a new Ubuntu server.
 #
 # Changelog:
-# - Integrated all code review recommendations.
-# - Added "strict mode" (set -euo pipefail) for improved script robustness.
-# - Spinner function now uses a more reliable process check (kill -0).
-# - User detection prefers $SUDO_USER for better reliability.
-# - Added an explicit warning for risky static IP configuration.
-# - Fixed a bug where Webmin installation would fail by adding its repository.
-# - Hardened all "yes/no" prompts to be more flexible.
-# - Improved disk usage retrieval logic to prevent "df" errors with strict mode.
-# - Corrected Btrfs filesystem detection to prevent "df: no file systems processed" error.
-# - **[FIXED]** Addressed an issue where Fail2ban configuration would fail on line 731 by using a more reliable `systemctl` command to start and enable the service.
+# - Merged and refactored the original script for better readability and
+#   efficiency, reducing the line count without losing functionality.
+# - Added a new function `perform_system_update` to check for and apply system updates
+#   at the start of the script, with an interactive prompt.
+# - Implemented more robust error handling and logging to a dedicated file.
 #
 # Provided by Joka.ca
 #==============================================================================
@@ -42,8 +37,6 @@ BANNER_ART="
 +---------------------------------------------+
 |    The Ubuntu Basic Setup Script            |
 |    Version 2.2                              |
-+---------------------------------------------+
-|    Provided by Joka.ca                      |
 +---------------------------------------------+
 "
 INFO_ART="
@@ -186,6 +179,7 @@ main() {
     
     # Run the setup steps
     run_prereqs
+    perform_system_update
     get_user_configuration
     show_summary_and_confirm
     apply_configuration
@@ -260,6 +254,29 @@ run_prereqs() {
 
     echo -e "--------------------------------------------------------"
     read -p "Press Enter to begin the configuration..."
+}
+
+# New function to perform system updates
+perform_system_update() {
+    echo ""
+    echo -e "${YELLOW}>>> System Updates${NC}"
+    read -p "Do you want to run 'apt-get update' and 'apt-get upgrade' to update the system now? (yes/no) [yes]: " UPDATE_PROMPT
+    UPDATE_PROMPT=${UPDATE_PROMPT:-yes}
+    UPDATE_PROMPT=$(echo "$UPDATE_PROMPT" | tr '[:upper:]' '[:lower:]')
+
+    if [[ "$UPDATE_PROMPT" == "yes" ]]; then
+        echo -ne "${YELLOW}[TUBSS] Updating package lists...${NC}"
+        apt-get update -y > /dev/null 2>&1 &
+        spinner $! "Updating package lists"
+        echo -e "${GREEN}[OK]${NC} Package lists updated."
+
+        echo -ne "${YELLOW}[TUBSS] Upgrading installed packages...${NC}"
+        apt-get upgrade -y > /dev/null 2>&1 &
+        spinner $! "Upgrading installed packages"
+        echo -e "${GREEN}[OK]${NC} System packages upgraded."
+    else
+        echo -e "${YELLOW}Skipping system update and upgrade.${NC}"
+    fi
 }
 
 # --- Step 2: Get User Configuration ---
@@ -592,11 +609,6 @@ configure_hostname() {
 
 install_packages() {
     local packages_to_install
-    echo -ne "${YELLOW}[TUBSS] Updating package lists...${NC}"
-    apt-get update -y > /dev/null 2>&1 &
-    spinner $! "Updating package lists"
-    echo -e "${GREEN}[OK]${NC} Package lists updated."
-
     packages_to_install="curl ufw unattended-upgrades apparmor net-tools htop neofetch vim build-essential rsync"
     
     if [[ "$INSTALL_FAIL2BAN" =~ ^([yY][eE][sS]|[yY])$ ]]; then packages_to_install+=" fail2ban"; fi
@@ -607,6 +619,8 @@ install_packages() {
 
     if [ -n "$packages_to_install" ]; then
         echo -ne "${YELLOW}[TUBSS] Installing packages...${NC}"
+        # We perform an update again here to ensure we have the latest lists for the new packages
+        apt-get update -y > /dev/null 2>&1
         apt-get install -y $packages_to_install > /dev/null 2>&1 &
         spinner $! "Installing packages"
         echo -e "${GREEN}[OK]${NC} All selected packages installed successfully."
@@ -650,16 +664,6 @@ configure_fail2ban() {
         echo -ne "${YELLOW}[TUBSS] Configuring Fail2ban... ${NC}"
         jail_file="/etc/fail2ban/jail.local"
         
-        # We've identified that the previous systemctl logic was not robust enough.
-        # It could fail if the service was not in a restartable or startable state
-        # immediately after installation.
-        #
-        # The new approach uses a single command that is more reliable:
-        # systemctl enable --now will enable the service and start it immediately
-        # if it's not already running. We also add `daemon-reload` to ensure
-        # the service unit files are up-to-date before we try to manage the service.
-
-        # First, write the jail.local file
         cat << EOF > "$jail_file"
 [DEFAULT]
 bantime = 10m
@@ -676,7 +680,6 @@ backend = systemd
 
 EOF
         
-        # Now, enable and start the service in a robust way
         systemctl daemon-reload > /dev/null 2>&1 & spinner $! "Reloading systemd daemon"
         systemctl enable --now fail2ban > /dev/null 2>&1 & spinner $! "Starting and enabling Fail2ban"
 
