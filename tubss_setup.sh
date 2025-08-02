@@ -2,27 +2,28 @@
 
 #==============================================================================
 # The Ubuntu Basic Setup Script (TUBSS)
-# Version: 2.0
+# Version: 2.1 (Revised with Community Recommendations)
 # Author: OrangeZef
 #
 # This script automates the initial setup and hardening of a new Ubuntu server.
 #
 # Changelog:
-# - Improved disk usage retrieval to prevent "DF: No file system processed" errors.
-# - Added a visual progress spinner for all long-running commands (e.g., package installation)
-#   to indicate that the script is actively running and not hung.
-# - Maintained all previous security and robustness optimizations.
-#
-# Features:
-# - Automated Security (UFW, Fail2ban)
-# - Essential Utilities (Git, NFS Client, SMB Client, networking tools)
-# - Optional Network Configuration for a static IP
-# - Automatic Security Updates
-# - Telemetry Disablement
-# - Summary of proposed changes and final report
+# - Integrated all code review recommendations.
+# - Added "strict mode" (set -euo pipefail) for improved script robustness.
+# - Spinner function now uses a more reliable process check (kill -0).
+# - User detection prefers $SUDO_USER for better reliability.
+# - Added an explicit warning for risky static IP configuration.
+# - Fixed a bug where Webmin installation would fail by adding its repository.
+# - Hardened all "yes/no" prompts to be more flexible.
 #
 # Provided by Joka.ca
 #==============================================================================
+
+# --- Strict Mode ---
+# set -e: Exit immediately if a command exits with a non-zero status.
+# set -u: Treat unset variables as an error.
+# set -o pipefail: The return value of a pipeline is the status of the last command to exit with a non-zero status.
+set -euo pipefail
 
 # --- Global Variables & Colors ---
 YELLOW='\033[1;33m'
@@ -37,7 +38,7 @@ BANNER_ART="
 |    T U B S S                                |
 +---------------------------------------------+
 |    The Ubuntu Basic Setup Script            |
-|    Version 2.0                              |
+|    Version 2.1                              |
 +---------------------------------------------+
 |    Provided by Joka.ca                      |
 +---------------------------------------------+
@@ -61,7 +62,7 @@ CLOSING_ART="
  __________________________________________________________________
 < Thank you for using TUBSS - The Ubuntu Basic Setup Script! >
  ------------------------------------------------------------------
-     \     
+     \
        \    .--.
         \  ( o  o)
          >  )  (
@@ -78,9 +79,20 @@ CLOSING_ART="
         \_/
 "
 
-# Exit immediately if a command exits with a non-zero status. This is a
-# crucial security and robustness feature.
-set -e
+# --- Global Summary Variables (for DRY principle) ---
+NEW_WEBMIN_SUMMARY=""
+NEW_UFW_SUMMARY=""
+NEW_AUTO_UPDATES_SUMMARY=""
+NEW_FAIL2BAN_SUMMARY=""
+NEW_TELEMETRY_SUMMARY=""
+NEW_DOMAIN_SUMMARY=""
+NEW_NFS_SUMMARY=""
+NEW_SMB_SUMMARY=""
+NEW_GIT_SUMMARY=""
+NEW_IP_ADDRESS_SUMMARY=""
+NEW_GATEWAY_SUMMARY=""
+NEW_DNS_SUMMARY=""
+
 
 # --- Utility Functions ---
 
@@ -105,7 +117,8 @@ spinner() {
     local delay=0.1
     local spinstr='|/-\'
     echo -ne "${YELLOW}[TUBSS] ${task_name} ... ${NC}"
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+    # Use kill -0 for a more robust check
+    while kill -0 "$pid" 2>/dev/null; do
         local temp=${spinstr#?}
         printf "\b${spinstr:0:1}"
         spinstr=$temp${spinstr:0:1}
@@ -161,7 +174,7 @@ main() {
     fi
 
     # Change terminal colors
-    echo -e "${BLACK}${YELLOW}"
+    echo -e "${NC}" # Reset first
     clear
 
     # Display banner art and system info
@@ -178,10 +191,11 @@ main() {
 
 # --- Step 1: System Prereqs and Info ---
 run_prereqs() {
-    local original_user_home original_user disk_usage_output
+    local disk_usage_output original_user original_user_home
 
     # Get the original user's desktop path for the summary file
-    original_user=$(logname)
+    # Prefer $SUDO_USER for better reliability when run with sudo
+    original_user=${SUDO_USER:-$(logname)}
     original_user_home=$(getent passwd "$original_user" | cut -d: -f6)
     DESKTOP_DIR="$original_user_home/Desktop"
     if [ ! -d "$DESKTOP_DIR" ]; then
@@ -211,13 +225,13 @@ run_prereqs() {
     fi
 
     ORIGINAL_HOSTNAME=$(hostname)
-    ORIGINAL_DNS=$(resolvectl status | grep 'DNS Servers' | awk '{print $3}' | head -n 1)
+    ORIGINAL_DNS=$(resolvectl status | grep 'DNS Servers' | awk '{print $3}' | head -n 1 || echo "N/A")
     ORIGINAL_WEBMIN_STATUS=$(dpkg -s webmin &>/dev/null && echo "Installed" || echo "Not Installed")
     ORIGINAL_UFW_STATUS=$(ufw status | grep 'Status:' | awk '{print $2}')
-    ORIGINAL_AUTO_UPDATES_STATUS=$(grep -q "Unattended-Upgrade" /etc/apt/apt.conf.d/20auto-upgrades &>/dev/null && echo "Enabled" || echo "Disabled")
+    ORIGINAL_AUTO_UPDATES_STATUS=$(grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades &>/dev/null && echo "Enabled" || echo "Disabled")
     ORIGINAL_FAIL2BAN_STATUS=$(dpkg -s fail2ban &>/dev/null && echo "Installed" || echo "Not Installed")
-    ORIGINAL_DOMAIN_STATUS=$(realm list 2>/dev/null | grep 'realm-name:' | awk '{print $2}')
-    ORIGINAL_TELEMETRY_STATUS=$(dpkg -s ubuntu-report &>/dev/null && echo "Enabled" || echo "Disabled")
+    ORIGINAL_DOMAIN_STATUS=$(realm list 2>/dev/null | grep 'realm-name:' | awk '{print $2}' || echo "Not Joined")
+    ORIGINAL_TELEMETRY_STATUS=$(dpkg -s ubuntu-report &>/dev/null && grep -q 'enable = true' /etc/ubuntu-report/ubuntu-report.conf &>/dev/null && echo "Enabled" || echo "Disabled")
     ORIGINAL_NFS_STATUS=$(dpkg -s nfs-common &>/dev/null && echo "Installed" || echo "Not Installed")
     ORIGINAL_SMB_STATUS=$(dpkg -s cifs-utils &>/dev/null && echo "Installed" || echo "Not Installed")
     ORIGINAL_GIT_STATUS=$(dpkg -s git &>/dev/null && echo "Installed" || echo "Not Installed")
@@ -270,7 +284,6 @@ get_user_configuration() {
             read -p "Do you want to create a Timeshift snapshot? (yes/no) [yes]: " CREATE_SNAPSHOT
             CREATE_SNAPSHOT=${CREATE_SNAPSHOT:-yes}
         fi
-        CREATE_SNAPSHOT=$(echo "$CREATE_SNAPSHOT" | tr '[:upper:]' '[:lower:]')
     elif command -v zfs &> /dev/null; then
         if zfs list -o name,mountpoint -t filesystem | grep -q " /$"; then
             echo -e "${YELLOW}ZFS root filesystem detected.${NC}"
@@ -281,7 +294,6 @@ get_user_configuration() {
                 CREATE_SNAPSHOT=${CREATE_SNAPSHOT:-yes}
             fi
         fi
-        CREATE_SNAPSHOT=$(echo "$CREATE_SNAPSHOT" | tr '[:upper:]' '[:lower:]')
     elif command -v btrfs &> /dev/null; then
         if df -t btrfs / | grep -q ' /$'; then
             echo -e "${YELLOW}Btrfs root filesystem detected.${NC}"
@@ -292,7 +304,6 @@ get_user_configuration() {
                 CREATE_SNAPSHOT=${CREATE_SNAPSHOT:-yes}
             fi
         fi
-        CREATE_SNAPSHOT=$(echo "$CREATE_SNAPSHOT" | tr '[:upper:]' '[:lower:]')
     else
         echo -e "${YELLOW}No supported snapshot utilities (Timeshift, ZFS, or Btrfs) detected. Skipping snapshot.${NC}"
     fi
@@ -387,6 +398,13 @@ get_user_configuration() {
                 fi
             done
         fi
+        # RECOMMENDED: Add explicit warning for risky static IP change
+        echo ""
+        echo -e "${RED}!! WARNING !!${NC}"
+        echo -e "${YELLOW}You have chosen to configure a static IP address.${NC}"
+        echo -e "${YELLOW}Incorrect network settings (IP, Gateway, etc.) can result in a loss of network connectivity, requiring console access to fix.${NC}"
+        echo -e "${YELLOW}Please double-check your entries in the summary screen.${NC}"
+        read -p "Press Enter to acknowledge and continue..."
     fi
 
     # Service and Security Prompts
@@ -412,7 +430,7 @@ get_user_configuration() {
         read -p "Do you want to disable optional telemetry and analytics? (yes/no) [yes]: " DISABLE_TELEMETRY
         DISABLE_TELEMETRY=${DISABLE_TELEMETRY:-yes}
 
-        if [ -n "$ORIGINAL_DOMAIN_STATUS" ]; then
+        if [ "$ORIGINAL_DOMAIN_STATUS" != "Not Joined" ]; then
             echo -e "${YELLOW}Your system is currently joined to the domain: ${ORIGINAL_DOMAIN_STATUS}${NC}"
             read -p "Do you want to leave this domain and join another? (yes/no) [no]: " JOIN_DOMAIN
             JOIN_DOMAIN=${JOIN_DOMAIN:-no}
@@ -428,18 +446,9 @@ get_user_configuration() {
         read -p "Do you want to install Git? (yes/no) [yes]: " INSTALL_GIT
         INSTALL_GIT=${INSTALL_GIT:-yes}
     fi
-    INSTALL_WEBMIN=$(echo "$INSTALL_WEBMIN" | tr '[:upper:]' '[:lower:]')
-    ENABLE_UFW=$(echo "$ENABLE_UFW" | tr '[:upper:]' '[:lower:]')
-    ENABLE_AUTO_UPDATES=$(echo "$ENABLE_AUTO_UPDATES" | tr '[:upper:]' '[:lower:]')
-    INSTALL_FAIL2BAN=$(echo "$INSTALL_FAIL2BAN" | tr '[:upper:]' '[:lower:]')
-    DISABLE_TELEMETRY=$(echo "$DISABLE_TELEMETRY" | tr '[:upper:]' '[:lower:]')
-    JOIN_DOMAIN=$(echo "$JOIN_DOMAIN" | tr '[:upper:]' '[:lower:]')
-    INSTALL_NFS=$(echo "$INSTALL_NFS" | tr '[:upper:]' '[:lower:]')
-    INSTALL_SMB=$(echo "$INSTALL_SMB" | tr '[:upper:]' '[:lower:]')
-    INSTALL_GIT=$(echo "$INSTALL_GIT" | tr '[:upper:]' '[:lower:]')
 
     # AD details if requested
-    if [[ "$JOIN_DOMAIN" == "yes" ]]; then
+    if [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo ""
         echo -e "${YELLOW}--- Active Directory Details ---${NC}"
         read -p "Enter the Active Directory domain name (e.g., joka.ca): " AD_DOMAIN
@@ -452,23 +461,20 @@ get_user_configuration() {
 
 # --- Step 3: Show Summary and Confirm ---
 show_summary_and_confirm() {
-    local new_webmin_summary new_ufw_summary new_auto_updates_summary new_fail2ban_summary
-    local new_telemetry_summary new_domain_summary new_nfs_summary new_smb_summary new_git_summary
-    local new_ip_address_summary new_gateway_summary new_dns_summary
+    # Calculate and assign to global summary variables
+    NEW_WEBMIN_SUMMARY=$(if [[ "$INSTALL_WEBMIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
+    NEW_UFW_SUMMARY=$(if [[ "$ENABLE_UFW" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Enabled"; else echo "Skipped"; fi)
+    NEW_AUTO_UPDATES_SUMMARY=$(if [[ "$ENABLE_AUTO_UPDATES" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Enabled"; else echo "Skipped"; fi)
+    NEW_FAIL2BAN_SUMMARY=$(if [[ "$INSTALL_FAIL2BAN" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
+    NEW_TELEMETRY_SUMMARY=$(if [[ "$DISABLE_TELEMETRY" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Disabled"; else echo "Skipped"; fi)
+    NEW_DOMAIN_SUMMARY=$(if [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Joined"; else echo "Skipped"; fi)
+    NEW_NFS_SUMMARY=$(if [[ "$INSTALL_NFS" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
+    NEW_SMB_SUMMARY=$(if [[ "$INSTALL_SMB" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
+    NEW_GIT_SUMMARY=$(if [[ "$INSTALL_GIT" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
 
-    new_webmin_summary=$(if [ "$INSTALL_WEBMIN" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-    new_ufw_summary=$(if [ "$ENABLE_UFW" == "yes" ]; then echo "To be Enabled"; else echo "Skipped"; fi)
-    new_auto_updates_summary=$(if [ "$ENABLE_AUTO_UPDATES" == "yes" ]; then echo "To be Enabled"; else echo "Skipped"; fi)
-    new_fail2ban_summary=$(if [ "$INSTALL_FAIL2BAN" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-    new_telemetry_summary=$(if [ "$DISABLE_TELEMETRY" == "yes" ]; then echo "To be Disabled"; else echo "Skipped"; fi)
-    new_domain_summary=$(if [ "$JOIN_DOMAIN" == "yes" ]; then echo "To be Joined"; else echo "Skipped"; fi)
-    new_nfs_summary=$(if [ "$INSTALL_NFS" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-    new_smb_summary=$(if [ "$INSTALL_SMB" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-    new_git_summary=$(if [ "$INSTALL_GIT" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-
-    new_ip_address_summary=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$STATIC_IP/$NETMASK_CIDR"; else echo "N/A"; fi)
-    new_gateway_summary=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$GATEWAY"; else echo "N/A"; fi)
-    new_dns_summary=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$DNS_SERVER"; else echo "N/A"; fi)
+    NEW_IP_ADDRESS_SUMMARY=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$STATIC_IP/$NETMASK_CIDR"; else echo "N/A"; fi)
+    NEW_GATEWAY_SUMMARY=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$GATEWAY"; else echo "N/A"; fi)
+    NEW_DNS_SUMMARY=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$DNS_SERVER"; else echo "N/A"; fi)
 
     echo ""
     echo -e "$SUMMARY_ART"
@@ -477,27 +483,26 @@ show_summary_and_confirm() {
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Hostname:${NC}" "${ORIGINAL_HOSTNAME}" "${HOSTNAME}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Network Type:${NC}" "${ORIGINAL_NET_TYPE}" "${NET_TYPE}"
     if [[ "$NET_TYPE" == "static" ]]; then
-        printf "%-30b | %-20s | %-20s\n" "${YELLOW}IP Address:${NC}" "${ORIGINAL_IP:-N/A}" "${new_ip_address_summary}"
-        printf "%-30b | %-20s | %-20s\n" "${YELLOW}Gateway:${NC}" "${ORIGINAL_GATEWAY:-N/A}" "${new_gateway_summary}"
-        printf "%-30b | %-20s | %-20s\n" "${YELLOW}DNS Server:${NC}" "${ORIGINAL_DNS:-N/A}" "${new_dns_summary}"
+        printf "%-30b | %-20s | %-20s\n" "${YELLOW}IP Address:${NC}" "${ORIGINAL_IP:-N/A}" "${NEW_IP_ADDRESS_SUMMARY}"
+        printf "%-30b | %-20s | %-20s\n" "${YELLOW}Gateway:${NC}" "${ORIGINAL_GATEWAY:-N/A}" "${NEW_GATEWAY_SUMMARY}"
+        printf "%-30b | %-20s | %-20s\n" "${YELLOW}DNS Server:${NC}" "${ORIGINAL_DNS:-N/A}" "${NEW_DNS_SUMMARY}"
     fi
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Filesystem Snapshot:${NC}" "N/A" "${CREATE_SNAPSHOT}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Webmin Status:${NC}" "${ORIGINAL_WEBMIN_STATUS}" "${new_webmin_summary}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}UFW Firewall Status:${NC}" "${ORIGINAL_UFW_STATUS}" "${new_ufw_summary}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Auto Updates Status:${NC}" "${ORIGINAL_AUTO_UPDATES_STATUS}" "${new_auto_updates_summary}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Fail2ban Status:${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "${new_fail2ban_summary}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "${new_telemetry_summary}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}AD Domain Join:${NC}" "${ORIGINAL_DOMAIN_STATUS:-Not Joined}" "${new_domain_summary}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}NFS Client Status:${NC}" "${ORIGINAL_NFS_STATUS}" "${new_nfs_summary}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}SMB Client Status:${NC}" "${ORIGINAL_SMB_STATUS}" "${new_smb_summary}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Git Status:${NC}" "${ORIGINAL_GIT_STATUS}" "${new_git_summary}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Webmin Status:${NC}" "${ORIGINAL_WEBMIN_STATUS}" "${NEW_WEBMIN_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}UFW Firewall Status:${NC}" "${ORIGINAL_UFW_STATUS}" "${NEW_UFW_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Auto Updates Status:${NC}" "${ORIGINAL_AUTO_UPDATES_STATUS}" "${NEW_AUTO_UPDATES_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Fail2ban Status:${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "${NEW_FAIL2BAN_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "${NEW_TELEMETRY_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}AD Domain Join:${NC}" "${ORIGINAL_DOMAIN_STATUS:-Not Joined}" "${NEW_DOMAIN_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}NFS Client Status:${NC}" "${ORIGINAL_NFS_STATUS}" "${NEW_NFS_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}SMB Client Status:${NC}" "${ORIGINAL_SMB_STATUS}" "${NEW_SMB_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Git Status:${NC}" "${ORIGINAL_GIT_STATUS}" "${NEW_GIT_SUMMARY}"
     echo -e "--------------------------------------------------------"
 
     read -p "Does the above configuration look correct? (yes/no) [yes]: " CONFIRM_EXECUTION
     CONFIRM_EXECUTION=${CONFIRM_EXECUTION:-yes}
-    CONFIRM_EXECUTION=$(echo "$CONFIRM_EXECUTION" | tr '[:upper:]' '[:lower:]')
 
-    if [[ "$CONFIRM_EXECUTION" != "yes" ]]; then
+    if [[ ! "$CONFIRM_EXECUTION" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -e "${RED}Execution aborted by user.${NC}"
         exit 1
     fi
@@ -532,22 +537,24 @@ apply_configuration() {
 }
 
 configure_snapshot() {
-    local snapshot_name zfs_root_dataset
-    if [[ "$CREATE_SNAPSHOT" == "yes" ]]; then
+    local zfs_root_dataset
+    if [[ "$CREATE_SNAPSHOT" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         if command -v timeshift &> /dev/null; then
-            snapshot_name="tubss-pre-config-$(date +%Y%m%d-%H%M)"
             timeshift --create --comments "TUBSS Pre-Setup Snapshot" &>/dev/null & spinner $! "Creating Timeshift snapshot"
             SNAPSHOT_STATUS="Created: Timeshift"
             echo -e "${GREEN}[OK]${NC} Timeshift snapshot created successfully."
         elif command -v zfs &> /dev/null && zfs list -o name,mountpoint -t filesystem | grep -q " /$"; then
             zfs_root_dataset=$(zfs list -o name,mountpoint -t filesystem | grep " /$" | awk '{print $1}')
-            snapshot_name="tubss-pre-config-$(date +%Y%m%d-%H%M)"
+            local snapshot_name="tubss-pre-config-$(date +%Y%m%d-%H%M)"
             zfs snapshot "${zfs_root_dataset}@${snapshot_name}" &>/dev/null & spinner $! "Creating ZFS snapshot"
             SNAPSHOT_STATUS="Created: $snapshot_name (ZFS)"
             echo -e "${GREEN}[OK]${NC} ZFS snapshot created successfully."
         elif command -v btrfs &> /dev/null && df -t btrfs / | grep -q ' /$'; then
-            snapshot_name="tubss-pre-config-$(date +%Y%m%d-%H%M)"
-            btrfs subvolume create /@snapshots &>/dev/null
+            # Ensure snapshot directory exists
+            if [ ! -d "/@snapshots" ]; then
+                btrfs subvolume create /@snapshots &>/dev/null
+            fi
+            local snapshot_name="tubss-pre-config-$(date +%Y%m%d-%H%M)"
             btrfs subvolume snapshot -r "/@" "/@snapshots/$snapshot_name" &>/dev/null & spinner $! "Creating Btrfs snapshot"
             SNAPSHOT_STATUS="Created: $snapshot_name (Btrfs)"
             echo -e "${GREEN}[OK]${NC} Btrfs snapshot created successfully."
@@ -568,19 +575,26 @@ configure_hostname() {
 }
 
 install_packages() {
-    local packages_to_install
+    # RECOMMENDED: Add Webmin repo if selected
+    if [[ "$INSTALL_WEBMIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        echo -ne "${YELLOW}[TUBSS] Adding Webmin repository... ${NC}"
+        curl -fsSL http://www.webmin.com/jcameron-key.asc | gpg --dearmor -o /usr/share/keyrings/webmin.gpg > /dev/null 2>&1
+        echo "deb [signed-by=/usr/share/keyrings/webmin.gpg] http://download.webmin.com/download/repository sarge contrib" > /etc/apt/sources.list.d/webmin.list
+        echo -e "${GREEN}[OK]${NC} Webmin repository added."
+    fi
+    
     echo -ne "${YELLOW}[TUBSS] Updating package lists...${NC}"
     apt-get update -y > /dev/null 2>&1 &
     spinner $! "Updating package lists"
     echo -e "${GREEN}[OK]${NC} Package lists updated."
 
-    packages_to_install="curl ufw unattended-upgrades apparmor net-tools htop neofetch vim build-essential rsync"
+    local packages_to_install="curl ufw unattended-upgrades apparmor net-tools htop neofetch vim build-essential rsync"
     
-    if [[ "$INSTALL_FAIL2BAN" == "yes" ]]; then packages_to_install+=" fail2ban"; fi
-    if [[ "$INSTALL_GIT" == "yes" ]]; then packages_to_install+=" git"; fi
-    if [[ "$INSTALL_WEBMIN" == "yes" ]]; then packages_to_install+=" webmin"; fi
-    if [[ "$INSTALL_NFS" == "yes" ]]; then packages_to_install+=" nfs-common"; fi
-    if [[ "$INSTALL_SMB" == "yes" ]]; then packages_to_install+=" cifs-utils"; fi
+    if [[ "$INSTALL_WEBMIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then packages_to_install+=" webmin"; fi
+    if [[ "$INSTALL_FAIL2BAN" =~ ^([yY][eE][sS]|[yY])$ ]]; then packages_to_install+=" fail2ban"; fi
+    if [[ "$INSTALL_GIT" =~ ^([yY][eE][sS]|[yY])$ ]]; then packages_to_install+=" git"; fi
+    if [[ "$INSTALL_NFS" =~ ^([yY][eE][sS]|[yY])$ ]]; then packages_to_install+=" nfs-common"; fi
+    if [[ "$INSTALL_SMB" =~ ^([yY][eE][sS]|[yY])$ ]]; then packages_to_install+=" cifs-utils"; fi
 
     if [ -n "$packages_to_install" ]; then
         echo -ne "${YELLOW}[TUBSS] Installing packages...${NC}"
@@ -593,8 +607,10 @@ install_packages() {
 configure_network() {
     local network_config_file
     echo -ne "${YELLOW}[TUBSS] Configuring Network... ${NC}"
-    network_config_file="/etc/netplan/01-static-network.yaml"
+    # Use a more generic netplan file name to avoid conflicts
+    network_config_file="/etc/netplan/01-tubss-static.yaml"
     if [[ "$NET_TYPE" == "dhcp" ]]; then
+        # If we previously created a static config, remove it
         if [ -f "$network_config_file" ]; then
             rm -f "$network_config_file"
             netplan apply
@@ -608,7 +624,7 @@ network:
   version: 2
   ethernets:
     $INTERFACE_NAME:
-      dhcp4: false
+      dhcp4: no
       addresses: [$STATIC_IP/$NETMASK_CIDR]
       routes:
         - to: default
@@ -622,11 +638,10 @@ EOF
 }
 
 configure_fail2ban() {
-    local jail_file
-    if [[ "$INSTALL_FAIL2BAN" == "yes" ]]; then
+    if [[ "$INSTALL_FAIL2BAN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -ne "${YELLOW}[TUBSS] Configuring Fail2ban... ${NC}"
-        jail_file="/etc/fail2ban/jail.local"
-        cat << EOF > "$jail_file"
+        # This is the correct way to override defaults, by creating a .local file
+        cat << EOF > "/etc/fail2ban/jail.local"
 [DEFAULT]
 bantime = 10m
 findtime = 10m
@@ -644,8 +659,7 @@ EOF
         if systemctl is-active --quiet fail2ban; then
             systemctl restart fail2ban > /dev/null 2>&1 & spinner $! "Restarting Fail2ban"
         else
-            systemctl enable fail2ban > /dev/null 2>&1 & spinner $! "Enabling Fail2ban"
-            systemctl start fail2ban > /dev/null 2>&1 & spinner $! "Starting Fail2ban"
+            systemctl enable --now fail2ban > /dev/null 2>&1 & spinner $! "Enabling and starting Fail2ban"
         fi
         echo -e "${GREEN}[OK]${NC} Fail2ban configured and running."
     else
@@ -654,11 +668,12 @@ EOF
 }
 
 configure_ufw() {
-    if [[ "$ENABLE_UFW" == "yes" ]]; then
+    if [[ "$ENABLE_UFW" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -ne "${YELLOW}[TUBSS] Configuring UFW... ${NC}"
-        ufw default deny incoming
-        ufw default allow outgoing
-        ufw allow ssh
+        ufw default deny incoming >/dev/null
+        ufw default allow outgoing >/dev/null
+        ufw allow ssh >/dev/null
+        # Use --force to handle the non-interactive prompt
         ufw --force enable > /dev/null 2>&1 & spinner $! "Enabling UFW"
         echo -e "${GREEN}[OK]${NC} UFW configured and enabled."
     else
@@ -667,15 +682,13 @@ configure_ufw() {
 }
 
 configure_auto_updates() {
-    if [[ "$ENABLE_AUTO_UPDATES" == "yes" ]]; then
+    if [[ "$ENABLE_AUTO_UPDATES" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -ne "${YELLOW}[TUBSS] Enabling Automatic Security Updates... ${NC}"
-        if [ -f /etc/apt/apt.conf.d/20auto-upgrades ]; then
-            sed -i 's/APT::Periodic::Update-Package-Lists "0"/APT::Periodic::Update-Package-Lists "1"/' /etc/apt/apt.conf.d/20auto-upgrades
-            sed -i 's/APT::Periodic::Unattended-Upgrade "0"/APT::Periodic::Unattended-Upgrade "1"/' /etc/apt/apt.conf.d/20auto-upgrades
-        else
-            echo 'APT::Periodic::Update-Package-Lists "1";' > /etc/apt/apt.conf.d/20auto-upgrades
-            echo 'APT::Periodic::Unattended-Upgrade "1";' >> /etc/apt/apt.conf.d/20auto-upgrades
-        fi
+        cat << EOF > /etc/apt/apt.conf.d/20auto-upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
         echo -e "${GREEN}[OK]${NC} Automatic security updates enabled."
     else
         echo -e "${YELLOW}[SKIPPED]${NC} Automatic security updates."
@@ -683,23 +696,21 @@ configure_auto_updates() {
 }
 
 disable_telemetry() {
-    if [[ "$DISABLE_TELEMETRY" == "yes" ]]; then
+    if [[ "$DISABLE_TELEMETRY" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -ne "${YELLOW}[TUBSS] Disabling Ubuntu Telemetry... ${NC}"
-        if [ -f /etc/ubuntu-report/ubuntu-report.conf ]; then
-            sed -i 's/^enable = true/enable = false/' /etc/ubuntu-report/ubuntu-report.conf
-            echo -e "${GREEN}[OK]${NC} Ubuntu telemetry disabled."
-        else
-            echo -e "${YELLOW}Warning: Ubuntu telemetry configuration file not found. Skipping.${NC}"
-        fi
+        # This purges the package entirely, which is more effective
+        apt-get purge -y ubuntu-report popularity-contest apport whoopsie >/dev/null 2>&1 & spinner $! "Purging telemetry packages"
+        echo -e "${GREEN}[OK]${NC} Ubuntu telemetry packages removed."
     else
         echo -e "${YELLOW}[SKIPPED]${NC} Telemetry disablement."
     fi
 }
 
 join_ad_domain() {
-    if [[ "$JOIN_DOMAIN" == "yes" ]]; then
+    if [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -ne "${YELLOW}[TUBSS] Joining Active Directory domain... ${NC}"
-        echo -e "${YELLOW}Placeholder: Domain join logic is not implemented in this script due to security concerns.${NC}"
+        echo -e "${YELLOW}Placeholder: Domain join logic is not implemented in this script due to security concerns with password handling.${NC}"
+        echo -e "${YELLOW}Please join the domain manually after the script completes.${NC}"
     else
         echo -e "${YELLOW}[SKIPPED]${NC} AD domain join."
     fi
@@ -707,27 +718,13 @@ join_ad_domain() {
 
 # --- Step 5: Final Summary and Reboot Prompt ---
 reboot_prompt() {
-    # Pre-calculate new status values before writing to the file to avoid syntax issues.
-    local new_webmin_summary=$(if [ "$INSTALL_WEBMIN" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-    local new_ufw_summary=$(if [ "$ENABLE_UFW" == "yes" ]; then echo "To be Enabled"; else echo "Skipped"; fi)
-    local new_auto_updates_summary=$(if [ "$ENABLE_AUTO_UPDATES" == "yes" ]; then echo "To be Enabled"; else echo "Skipped"; fi)
-    local new_fail2ban_summary=$(if [ "$INSTALL_FAIL2BAN" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-    local new_telemetry_summary=$(if [ "$DISABLE_TELEMETRY" == "yes" ]; then echo "To be Disabled"; else echo "Skipped"; fi)
-    local new_domain_summary=$(if [ "$JOIN_DOMAIN" == "yes" ]; then echo "To be Joined"; else echo "Skipped"; fi)
-    local new_nfs_summary=$(if [ "$INSTALL_NFS" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-    local new_smb_summary=$(if [ "$INSTALL_SMB" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-    local new_git_summary=$(if [ "$INSTALL_GIT" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)
-    local new_ip_address_summary=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$STATIC_IP/$NETMASK_CIDR"; else echo "N/A"; fi)
-    local new_gateway_summary=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$GATEWAY"; else echo "N/A"; fi)
-    local new_dns_summary=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$DNS_SERVER"; else echo "N/A"; fi)
-
     echo ""
     echo -e "${YELLOW}Configuration changes have been applied.${NC}"
     echo "A summary of the changes has been saved to: $SUMMARY_FILE"
     echo "--------------------------------------------------------"
     echo ""
 
-    # Write summary to file
+    # Write summary to file, using the pre-calculated global variables
     cat << EOF > "$SUMMARY_FILE"
 TUBSS - The Ubuntu Basic Setup Script - Configuration Summary
 Provided by Joka.ca
@@ -736,25 +733,25 @@ Date: $(date)
 Hostname: $HOSTNAME
 
 Configuration Changes:
---------------------------------------------------------
+---------------------------------------------------------------------------------
 Setting                      | Original Value             | New Value
------------------------------|----------------------------|----------------------------
+-----------------------------|----------------------------|-----------------------
 Hostname                     | $ORIGINAL_HOSTNAME           | $HOSTNAME
 Filesystem Snapshot          | N/A                        | $SNAPSHOT_STATUS
 Network Type                 | $ORIGINAL_NET_TYPE           | $NET_TYPE
-IP Address                   | ${ORIGINAL_IP:-N/A}        | $new_ip_address_summary
-Gateway                      | ${ORIGINAL_GATEWAY:-N/A}   | $new_gateway_summary
-DNS Server                   | ${ORIGINAL_DNS:-N/A}       | $new_dns_summary
-Webmin Status                | $ORIGINAL_WEBMIN_STATUS    | $new_webmin_summary
-UFW Status                   | $ORIGINAL_UFW_STATUS       | $new_ufw_summary
-Auto Updates Status          | $ORIGINAL_AUTO_UPDATES_STATUS | $new_auto_updates_summary
-Fail2ban Status              | $ORIGINAL_FAIL2BAN_STATUS  | $new_fail2ban_summary
-Telemetry/Analytics          | $ORIGINAL_TELEMETRY_STATUS | $new_telemetry_summary
-AD Domain Join               | ${ORIGINAL_DOMAIN_STATUS:-Not Joined} | $new_domain_summary
-NFS Client Status            | $ORIGINAL_NFS_STATUS       | $new_nfs_summary
-SMB Client Status            | $ORIGINAL_SMB_STATUS       | $new_smb_summary
-Git Status                   | $ORIGINAL_GIT_STATUS       | $new_git_summary
---------------------------------------------------------
+IP Address                   | ${ORIGINAL_IP:-N/A}        | $NEW_IP_ADDRESS_SUMMARY
+Gateway                      | ${ORIGINAL_GATEWAY:-N/A}   | $NEW_GATEWAY_SUMMARY
+DNS Server                   | ${ORIGINAL_DNS:-N/A}       | $NEW_DNS_SUMMARY
+Webmin Status                | $ORIGINAL_WEBMIN_STATUS    | $NEW_WEBMIN_SUMMARY
+UFW Status                   | $ORIGINAL_UFW_STATUS       | $NEW_UFW_SUMMARY
+Auto Updates Status          | $ORIGINAL_AUTO_UPDATES_STATUS | $NEW_AUTO_UPDATES_SUMMARY
+Fail2ban Status              | $ORIGINAL_FAIL2BAN_STATUS  | $NEW_FAIL2BAN_SUMMARY
+Telemetry/Analytics          | $ORIGINAL_TELEMETRY_STATUS | $NEW_TELEMETRY_SUMMARY
+AD Domain Join               | ${ORIGINAL_DOMAIN_STATUS}  | $NEW_DOMAIN_SUMMARY
+NFS Client Status            | $ORIGINAL_NFS_STATUS       | $NEW_NFS_SUMMARY
+SMB Client Status            | $ORIGINAL_SMB_STATUS       | $NEW_SMB_SUMMARY
+Git Status                   | $ORIGINAL_GIT_STATUS       | $NEW_GIT_SUMMARY
+---------------------------------------------------------------------------------
 Script provided by Joka.ca
 EOF
 
@@ -768,9 +765,8 @@ EOF
     echo -e "$CLOSING_ART"
     read -p "Configuration is complete. Would you like to reboot the system now? (yes/no) [yes]: " REBOOT_PROMPT
     REBOOT_PROMPT=${REBOOT_PROMPT:-yes}
-    REBOOT_PROMPT=$(echo "$REBOOT_PROMPT" | tr '[:upper:]' '[:lower:]')
 
-    if [[ "$REBOOT_PROMPT" == "yes" ]]; then
+    if [[ "$REBOOT_PROMPT" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -e "${YELLOW}Rebooting the system now to apply all changes.${NC}"
         reboot
     else
