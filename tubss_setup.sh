@@ -16,6 +16,7 @@
 # - Fixed a bug where Webmin installation would fail by adding its repository.
 # - Hardened all "yes/no" prompts to be more flexible.
 # - Improved disk usage retrieval logic to prevent "df" errors with strict mode.
+# - **[FIXED]** Corrected Btrfs filesystem detection to prevent "df: no file systems processed" error.
 #
 # Provided by Joka.ca
 #==============================================================================
@@ -248,7 +249,7 @@ run_prereqs() {
     echo -e "${YELLOW}Memory:             ${NC}$(free -h | grep 'Mem:' | awk '{print $2}')"
     
     # Store disk usage in a variable and check for success
-    # This version is more robust against 'set -e' by wrapping the command in a subshell
+    # This version is robust against 'set -e' by wrapping the command in a subshell
     disk_usage_output=$( (df -h / | awk 'NR==2 {print $3 "/" $2 " (" $5 " used)"}') 2>/dev/null || echo "" )
     if [[ -z "$disk_usage_output" ]]; then
         echo -e "${YELLOW}Disk Usage (/):     ${NC}Failed to retrieve disk usage.${NC}"
@@ -297,7 +298,9 @@ get_user_configuration() {
             fi
         fi
     elif command -v btrfs &> /dev/null; then
-        if df -t btrfs / | grep -q ' /$'; then
+        # The `df` command can fail and cause the script to exit in strict mode.
+        # We redirect stderr to /dev/null to prevent this.
+        if df -t btrfs / 2>/dev/null | grep -q ' /$'; then
             echo -e "${YELLOW}Btrfs root filesystem detected.${NC}"
             if [[ "$CONFIG_CHOICE" == "default" ]]; then
                 CREATE_SNAPSHOT="yes"
@@ -497,9 +500,9 @@ show_summary_and_confirm() {
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Hostname:${NC}" "${ORIGINAL_HOSTNAME}" "${HOSTNAME}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Network Type:${NC}" "${ORIGINAL_NET_TYPE}" "${NET_TYPE}"
     if [[ "$NET_TYPE" == "static" ]]; then
-        printf "%-30b | %-20s | %-20s\n" "${YELLOW}IP Address:${NC}" "${ORIGINAL_IP:-N/A}" "${new_ip_address_summary}"
-        printf "%-30b | %-20s | %-20s\n" "${YELLOW}Gateway:${NC}" "${ORIGINAL_GATEWAY:-N/A}" "${new_gateway_summary}"
-        printf "%-30b | %-20s | %-20s\n" "${YELLOW}DNS Server:${NC}" "${ORIGINAL_DNS:-N/A}" "${new_dns_summary}"
+        printf "%-30b | %-20s | %-20s\n" "${YELLOW}IP Address:${NC}" "${ORIGINAL_IP:-N/A}" "${NEW_IP_ADDRESS_SUMMARY}"
+        printf "%-30b | %-20s | %-20s\n" "${YELLOW}Gateway:${NC}" "${ORIGINAL_GATEWAY:-N/A}" "${NEW_GATEWAY_SUMMARY}"
+        printf "%-30b | %-20s | %-20s\n" "${YELLOW}DNS Server:${NC}" "${ORIGINAL_DNS:-N/A}" "${NEW_DNS_SUMMARY}"
     fi
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Filesystem Snapshot:${NC}" "N/A" "${CREATE_SNAPSHOT}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Webmin Status:${NC}" "${ORIGINAL_WEBMIN_STATUS}" "${NEW_WEBMIN_SUMMARY}"
@@ -564,7 +567,7 @@ configure_snapshot() {
             zfs snapshot "${zfs_root_dataset}@${snapshot_name}" &>/dev/null & spinner $! "Creating ZFS snapshot"
             SNAPSHOT_STATUS="Created: $snapshot_name (ZFS)"
             echo -e "${GREEN}[OK]${NC} ZFS snapshot created successfully."
-        elif command -v btrfs &> /dev/null && df -t btrfs / | grep -q ' /$'; then
+        elif command -v btrfs &> /dev/null && df -t btrfs / 2>/dev/null | grep -q ' /$'; then
             snapshot_name="tubss-pre-config-$(date +%Y%m%d-%H%M)"
             btrfs subvolume create /@snapshots &>/dev/null
             btrfs subvolume snapshot -r "/@" "/@snapshots/$snapshot_name" &>/dev/null & spinner $! "Creating Btrfs snapshot"
