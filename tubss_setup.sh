@@ -2,7 +2,7 @@
 
 #==============================================================================
 # The Ubuntu Basic Setup Script (TUBSS)
-# Version: 0.4
+# Version: 0.5
 # Author: OrangeZef
 #
 # This script automates the initial setup and hardening of a new Ubuntu server.
@@ -156,9 +156,19 @@ fi
 SUMMARY_FILE="$DESKTOP_DIR/tubss_configuration_summary_$(date +%Y%m%d_%H%M%S).txt"
 
 # --- Capture Before Values ---
+# FIX: Use a more reliable way to get the primary IP, gateway, and interface.
+NETWORK_INFO=$(ip route get 8.8.8.8)
+ORIGINAL_IP=$(echo "$NETWORK_INFO" | awk '{print $7}')
+ORIGINAL_GATEWAY=$(echo "$NETWORK_INFO" | awk '{print $3}')
+ORIGINAL_INTERFACE=$(echo "$NETWORK_INFO" | awk '{print $5}')
+# If for some reason the above command fails, fall back to a less reliable method
+if [ -z "$ORIGINAL_IP" ]; then
+    ORIGINAL_IP=$(ip -o -4 a | awk '{print $4}' | grep -v 'lo' | head -n 1)
+    ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
+    ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
+fi
+
 ORIGINAL_HOSTNAME=$(hostname)
-ORIGINAL_IP=$(ip -o -4 a | awk '{print $4}' | grep -v 'lo' | head -n 1)
-ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
 ORIGINAL_DNS=$(resolvectl status | grep 'DNS Servers' | awk '{print $3}' | head -n 1)
 ORIGINAL_WEBMIN_STATUS=$(dpkg -s webmin &>/dev/null && echo "Installed" || echo "Not Installed")
 ORIGINAL_UFW_STATUS=$(ufw status | grep 'Status:' | awk '{print $2}')
@@ -166,7 +176,6 @@ ORIGINAL_AUTO_UPDATES_STATUS=$(grep -q "Unattended-Upgrade" /etc/apt/apt.conf.d/
 ORIGINAL_FAIL2BAN_STATUS=$(dpkg -s fail2ban &>/dev/null && echo "Installed" || echo "Not Installed")
 ORIGINAL_DOMAIN_STATUS=$(realm list 2>/dev/null | grep 'realm-name:' | awk '{print $2}')
 ORIGINAL_TELEMETRY_STATUS=$(dpkg -s ubuntu-report &>/dev/null && echo "Enabled" || echo "Disabled")
-# FIX: Change these to check for client packages
 ORIGINAL_NFS_STATUS=$(dpkg -s nfs-common &>/dev/null && echo "Installed" || echo "Not Installed")
 ORIGINAL_SMB_STATUS=$(dpkg -s cifs-utils &>/dev/null && echo "Installed" || echo "Not Installed")
 ORIGINAL_GIT_STATUS=$(dpkg -s git &>/dev/null && echo "Installed" || echo "Not Installed")
@@ -259,7 +268,7 @@ fi
 
 # Static IP specific prompts
 if [[ "$NET_TYPE" == "static" ]]; then
-    INTERFACE_NAME=$(ip -o -4 a | grep -v 'lo' | awk '{print $2, $4}' | grep -v '127.0.0.1' | awk '{print $1}' | head -n 1)
+    INTERFACE_NAME=$(echo "$NETWORK_INFO" | awk '{print $5}')
     if [[ "$USE_DEFAULTS" == "yes" ]]; then
         STATIC_IP="192.168.1.100" # A common but generic default
         NETMASK="24"
@@ -363,27 +372,26 @@ fi
 # --- Pre-Execution Configuration Review ---
 echo ""
 echo -e "$SUMMARY_ART"
-printf "%-30s | %-20s | %-20s\n" "Setting" "Original Value" "New Value"
+# FIX: Use %-30b to enable color interpretation in printf
+printf "%-30b | %-20s | %-20s\n" "Setting" "Original Value" "New Value"
 printf "%-30s | %-20s | %-20s\n" "------------------------------" "--------------------" "--------------------"
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}Hostname:${NC}" "${ORIGINAL_HOSTNAME}" "${HOSTNAME}"
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}Network Type:${NC}" "${ORIGINAL_IP:-N/A}" "${NET_TYPE}"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Hostname:${NC}" "${ORIGINAL_HOSTNAME}" "${HOSTNAME}"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Network Type:${NC}" "N/A" "${NET_TYPE}"
 if [[ "$NET_TYPE" == "static" ]]; then
-    printf "%-30s | %-20s | %-20s\n" "${YELLOW}IP Address:${NC}" "${ORIGINAL_IP:-N/A}" "${STATIC_IP}/${NETMASK}"
-    printf "%-30s | %-20s | %-20s\n" "${YELLOW}Gateway:${NC}" "${ORIGINAL_GATEWAY:-N/A}" "${GATEWAY}"
-    printf "%-30s | %-20s | %-20s\n" "${YELLOW}DNS Server:${NC}" "${ORIGINAL_DNS:-N/A}" "${DNS_SERVER}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}IP Address:${NC}" "${ORIGINAL_IP:-N/A}" "${STATIC_IP}/${NETMASK}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Gateway:${NC}" "${ORIGINAL_GATEWAY:-N/A}" "${GATEWAY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}DNS Server:${NC}" "${ORIGINAL_DNS:-N/A}" "${DNS_SERVER}"
 fi
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}Filesystem Snapshot:${NC}" "N/A" "${CREATE_SNAPSHOT}"
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}Webmin Status:${NC}" "${ORIGINAL_WEBMIN_STATUS}" "$(if [ "$INSTALL_WEBMIN" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}UFW Firewall Status:${NC}" "${ORIGINAL_UFW_STATUS}" "$(if [ "$ENABLE_UFW" == "yes" ]; then echo "To be Enabled"; else echo "Skipped"; fi)"
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}Auto Updates Status:${NC}" "${ORIGINAL_AUTO_UPDATES_STATUS}" "$(if [ "$ENABLE_AUTO_UPDATES" == "yes" ]; then echo "To be Enabled"; else echo "Skipped"; fi)"
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}Fail2ban Status:${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "$(if [ "$INSTALL_FAIL2BAN" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "$(if [ "$DISABLE_TELEMETRY" == "yes" ]; then echo "To be Disabled"; else echo "Skipped"; fi)"
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}AD Domain Join:${NC}" "${ORIGINAL_DOMAIN_STATUS:-Not Joined}" "$(if [ "$JOIN_DOMAIN" == "yes" ]; then echo "To be Joined"; else echo "Skipped"; fi)"
-# FIX: Update text to reflect "client" status
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}NFS Client Status:${NC}" "${ORIGINAL_NFS_STATUS}" "$(if [ "$INSTALL_NFS" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
-# FIX: Update text to reflect "client" status
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}SMB Client Status:${NC}" "${ORIGINAL_SMB_STATUS}" "$(if [ "$INSTALL_SMB" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
-printf "%-30s | %-20s | %-20s\n" "${YELLOW}Git Status:${NC}" "${ORIGINAL_GIT_STATUS}" "$(if [ "$INSTALL_GIT" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Filesystem Snapshot:${NC}" "N/A" "${CREATE_SNAPSHOT}"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Webmin Status:${NC}" "${ORIGINAL_WEBMIN_STATUS}" "$(if [ "$INSTALL_WEBMIN" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}UFW Firewall Status:${NC}" "${ORIGINAL_UFW_STATUS}" "$(if [ "$ENABLE_UFW" == "yes" ]; then echo "To be Enabled"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Auto Updates Status:${NC}" "${ORIGINAL_AUTO_UPDATES_STATUS}" "$(if [ "$ENABLE_AUTO_UPDATES" == "yes" ]; then echo "To be Enabled"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Fail2ban Status:${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "$(if [ "$INSTALL_FAIL2BAN" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "$(if [ "$DISABLE_TELEMETRY" == "yes" ]; then echo "To be Disabled"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}AD Domain Join:${NC}" "${ORIGINAL_DOMAIN_STATUS:-Not Joined}" "$(if [ "$JOIN_DOMAIN" == "yes" ]; then echo "To be Joined"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}NFS Client Status:${NC}" "${ORIGINAL_NFS_STATUS}" "$(if [ "$INSTALL_NFS" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}SMB Client Status:${NC}" "${ORIGINAL_SMB_STATUS}" "$(if [ "$INSTALL_SMB" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
+printf "%-30b | %-20s | %-20s\n" "${YELLOW}Git Status:${NC}" "${ORIGINAL_GIT_STATUS}" "$(if [ "$INSTALL_GIT" == "yes" ]; then echo "To be Installed"; else echo "Skipped"; fi)"
 echo -e "--------------------------------------------------------"
 
 read -p "Does the above configuration look correct? (yes/no) [yes]: " CONFIRM_EXECUTION
@@ -437,8 +445,6 @@ else
 fi
 
 # --- Package Installation ---
-# FIX: The original script was missing the installation logic.
-# This section now installs the selected packages.
 echo -ne "${YELLOW}[TUBSS] Updating package lists...${NC}"
 apt-get update -y > /dev/null 2>&1 & spinner $! "Updating package lists"
 echo -e "${GREEN}[OK]${NC} Package lists updated."
@@ -450,7 +456,6 @@ if [[ "$INSTALL_WEBMIN" == "yes" ]]; then PACKAGES_TO_INSTALL+=" webmin"; fi
 if [[ "$INSTALL_NFS" == "yes" ]]; then PACKAGES_TO_INSTALL+=" nfs-common"; fi
 if [[ "$INSTALL_SMB" == "yes" ]]; then PACKAGES_TO_INSTALL+=" cifs-utils"; fi
 
-# Always install these essential tools
 PACKAGES_TO_INSTALL+=" curl ufw unattended-upgrades apparmor net-tools htop neofetch vim build-essential rsync"
 
 if [ -n "$PACKAGES_TO_INSTALL" ]; then
@@ -600,7 +605,7 @@ Hostname: $HOSTNAME
 
 Configuration Changes:
 --------------------------------------------------------
-Setting                      | Original Value             | New Value                  
+Setting                      | Original Value             | New Value
 -----------------------------|----------------------------|----------------------------
 Hostname                     | $ORIGINAL_HOSTNAME           | $HOSTNAME
 Filesystem Snapshot          | N/A                        | $SNAPSHOT_STATUS
