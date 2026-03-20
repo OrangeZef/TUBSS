@@ -117,5 +117,9 @@ rm -f "$TEMP_CHECKSUM"
 # --- Run the downloaded script with the current shell ---
 echo -e "${YELLOW}Executing the TUBSS setup script now...${NC}"
 
-bash "$TEMP_SCRIPT"
+if [[ "${1:-}" == "--rollback" ]]; then
+    bash "$TEMP_SCRIPT" --rollback
+else
+    bash "$TEMP_SCRIPT"
+fi
 exit $?

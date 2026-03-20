@@ -2,9 +2,8 @@
 
 #==============================================================================
 # The Ubuntu Basic Setup Script (TUBSS)
-# Version: 2.3 (Idempotency, spinner error capture, UFW ordering, DRY summary,
-#               version check, array-based packages, netplan validation,
-#               logname fallback, AD password cleanup, exit 1 in handle_error)
+# Version: 2.4 (Pre-flight validation, custom UFW rules, post-apply
+#               connectivity test, rollback UI)
 # Author: OrangeZef
 #
 # This script automates the initial setup and hardening of a new Ubuntu server.
@@ -30,6 +29,10 @@
 # - [v2.3] Extracted display_config_summary() to eliminate DRY violation between show_summary_and_confirm() and reboot_prompt().
 # - [v2.3] Fixed logname fallback: uses ${SUDO_USER:-${USER:-root}} to avoid logname failure in non-TTY contexts.
 # - [v2.3] Added `unset AD_PASSWORD` at end of join_ad_domain() for credential hygiene.
+# - [v2.4] Added run_preflight() with disk, OS version, package server, and apt state checks.
+# - [v2.4] Added collect_custom_ufw_rules() and apply_custom_ufw_rules() for user-defined firewall rules.
+# - [v2.4] Added test_static_ip_connectivity() for post-apply network validation.
+# - [v2.4] Added run_rollback_ui() and --rollback flag for snapshot-based system recovery.
 #
 # Provided by Joka.ca
 #==============================================================================
@@ -53,7 +56,7 @@ BANNER_ART="
 |    T U B S S                                |
 +---------------------------------------------+
 |    The Ubuntu Basic Setup Script            |
-|    Version 2.3                              |
+|    Version 2.4                              |
 +---------------------------------------------+
 |    Provided by Joka.ca                      |
 +---------------------------------------------+
@@ -107,6 +110,18 @@ NEW_GIT_SUMMARY=""
 NEW_IP_ADDRESS_SUMMARY=""
 NEW_GATEWAY_SUMMARY=""
 NEW_DNS_SUMMARY=""
+
+# --- Custom UFW rules array ---
+# Elements: "port|protocol|direction|description"
+# Port ranges use hyphen: "5000-5010|tcp|allow|Dev range"
+CUSTOM_UFW_RULES=()
+
+# --- Pre-flight state ---
+PREFLIGHT_FAILED=0
+
+# --- Version detection globals (set by run_preflight, read by run_prereqs) ---
+DETECTED_VERSION=""
+SUPPORTED_VERSIONS=("20.04" "22.04" "24.04")
 
 
 # --- Utility Functions ---
@@ -185,6 +200,12 @@ trap 'cleanup' EXIT
 
 # Check for root privileges
 main() {
+    # Intercept --rollback before anything else
+    if [[ "${1:-}" == "--rollback" ]]; then
+        run_rollback_ui
+        exit 0
+    fi
+
     if [[ $EUID -ne 0 ]]; then
         echo -e "${RED}This script must be run with root privileges. Please use sudo.${NC}"
         exit 1
@@ -199,6 +220,7 @@ main() {
     echo -e "--------------------------------------------------------"
 
     # Run the setup steps
+    run_preflight
     run_prereqs
     get_user_configuration
     show_summary_and_confirm
@@ -206,13 +228,64 @@ main() {
     reboot_prompt
 }
 
+# --- Step 0: Pre-flight Validation ---
+run_preflight() {
+    echo ""
+    echo -e "${YELLOW}============================================================${NC}"
+    echo -e "${YELLOW}              [PREFLIGHT] System Checks${NC}"
+    echo -e "${YELLOW}============================================================${NC}"
+    echo ""
+
+    # Check 1: Root filesystem >= 2GB free
+    local avail_gb
+    avail_gb=$(df --output=avail -BG / | tail -1 | tr -d 'G ')
+    if (( avail_gb < 2 )); then
+        echo -e "${RED}[PREFLIGHT] [FAIL]${NC} Root filesystem has only ${avail_gb}GB free. At least 2GB is required."
+        PREFLIGHT_FAILED=1
+    else
+        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Root filesystem has ${avail_gb}GB free (>= 2GB required)."
+    fi
+
+    # Check 2: Ubuntu version supported — warn only (duplicate check removed from run_prereqs)
+    DETECTED_VERSION=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
+    if [[ ! " ${SUPPORTED_VERSIONS[*]} " =~ " ${DETECTED_VERSION} " ]]; then
+        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Ubuntu ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
+        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Proceeding anyway — some features may not work correctly."
+    else
+        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Ubuntu ${DETECTED_VERSION} detected — fully supported."
+    fi
+
+    # Check 3: Package server reachable — warn only
+    if curl --silent --max-time 5 --head http://archive.ubuntu.com > /dev/null 2>&1; then
+        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Package server archive.ubuntu.com is reachable."
+    else
+        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Package server archive.ubuntu.com is not reachable. Package installation may fail."
+    fi
+
+    # Check 4: apt state valid — warn only
+    if apt-get check > /dev/null 2>&1; then
+        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} apt state is valid."
+    else
+        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} apt state check failed. There may be broken packages or a lock conflict."
+    fi
+
+    echo ""
+
+    if (( PREFLIGHT_FAILED == 1 )); then
+        echo -e "${RED}[PREFLIGHT] One or more critical checks failed. Exiting.${NC}"
+        exit 1
+    fi
+
+    read -p "[PREFLIGHT] All checks passed. Press Enter to continue..."
+    echo ""
+}
+
 # --- Step 1: System Prereqs and Info ---
 run_prereqs() {
     local disk_usage_output original_user original_user_home
 
-    # Ubuntu version check
-    DETECTED_VERSION=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
-    SUPPORTED_VERSIONS=("20.04" "22.04" "24.04")
+    # Ubuntu version already detected and checked in run_preflight
+    # Display the result here for the info screen
     if [[ ! " ${SUPPORTED_VERSIONS[*]} " =~ " ${DETECTED_VERSION} " ]]; then
         echo -e "${YELLOW}[WARN]${NC} Ubuntu ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
         echo -e "${YELLOW}[WARN]${NC} Proceeding anyway — some features may not work correctly."
@@ -499,6 +572,84 @@ get_user_configuration() {
         echo "Note: The password will not be displayed as you type."
         read -s -p "Password: " AD_PASSWORD
     fi
+
+    # Custom UFW rules — only in manual mode with UFW enabled
+    if [[ "$ENABLE_UFW" =~ ^([yY][eE][sS]|[yY])$ ]] && [[ "$CONFIG_CHOICE" == "manual" ]]; then
+        collect_custom_ufw_rules
+    fi
+}
+
+# --- Feature 2: Collect Custom UFW Rules ---
+collect_custom_ufw_rules() {
+    local add_rule port proto dir desc rule_count=0
+    echo ""
+    echo -e "${YELLOW}--- Custom Firewall Rules ---${NC}"
+    echo -e "You may add up to 20 custom UFW rules. Port ranges use a hyphen (e.g., 5000-5010)."
+    echo ""
+
+    while true; do
+        if (( rule_count >= 20 )); then
+            echo -e "${YELLOW}[WARN]${NC} Maximum of 20 custom rules reached."
+            break
+        fi
+
+        read -p "Add a custom firewall rule? (yes/no) [no]: " add_rule
+        add_rule=${add_rule:-no}
+        add_rule=$(echo "$add_rule" | tr '[:upper:]' '[:lower:]')
+
+        if [[ ! "$add_rule" =~ ^([yY][eE][sS]|[yY]|yes)$ ]]; then
+            break
+        fi
+
+        # Prompt for port (single or range)
+        while true; do
+            read -p "  Port or range (e.g., 8080 or 5000-5010): " port
+            if [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]; then
+                break
+            else
+                echo -e "  ${RED}Invalid port. Enter a number (e.g., 8080) or range (e.g., 5000-5010).${NC}"
+            fi
+        done
+
+        # Prompt for protocol
+        while true; do
+            read -p "  Protocol (tcp/udp/both) [tcp]: " proto
+            proto=${proto:-tcp}
+            proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
+            if [[ "$proto" == "tcp" || "$proto" == "udp" || "$proto" == "both" ]]; then
+                break
+            else
+                echo -e "  ${RED}Invalid protocol. Enter tcp, udp, or both.${NC}"
+            fi
+        done
+
+        # Prompt for direction
+        while true; do
+            read -p "  Direction (allow/deny) [allow]: " dir
+            dir=${dir:-allow}
+            dir=$(echo "$dir" | tr '[:upper:]' '[:lower:]')
+            if [[ "$dir" == "allow" || "$dir" == "deny" ]]; then
+                break
+            else
+                echo -e "  ${RED}Invalid direction. Enter allow or deny.${NC}"
+            fi
+        done
+
+        # Prompt for description (optional)
+        read -p "  Description (optional, free text): " desc
+        desc=${desc:-""}
+
+        # Store as "port|protocol|direction|description"
+        CUSTOM_UFW_RULES+=("${port}|${proto}|${dir}|${desc}")
+        rule_count=$(( rule_count + 1 ))
+        echo -e "  ${GREEN}[OK]${NC} Rule added: ${dir} ${port}/${proto}${desc:+ — ${desc}}"
+    done
+
+    if (( ${#CUSTOM_UFW_RULES[@]} > 0 )); then
+        echo -e "${GREEN}[OK]${NC} ${#CUSTOM_UFW_RULES[@]} custom UFW rule(s) queued."
+    else
+        echo -e "${YELLOW}[INFO]${NC} No custom UFW rules added."
+    fi
 }
 
 # --- Shared Summary Display ---
@@ -516,6 +667,12 @@ display_config_summary() {
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Filesystem Snapshot:${NC}" "N/A" "${CREATE_SNAPSHOT}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Webmin Status:${NC}" "${ORIGINAL_WEBMIN_STATUS}" "${NEW_WEBMIN_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}UFW Firewall Status:${NC}" "${ORIGINAL_UFW_STATUS}" "${NEW_UFW_SUMMARY}"
+    local custom_rule_count="${#CUSTOM_UFW_RULES[@]}"
+    if (( custom_rule_count > 0 )); then
+        printf "%-30b | %-20s | %-20s\n" "${YELLOW}Custom UFW Rules:${NC}" "none" "${custom_rule_count} custom rules"
+    else
+        printf "%-30b | %-20s | %-20s\n" "${YELLOW}Custom UFW Rules:${NC}" "none" "none"
+    fi
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Auto Updates Status:${NC}" "${ORIGINAL_AUTO_UPDATES_STATUS}" "${NEW_AUTO_UPDATES_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Fail2ban Status:${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "${NEW_FAIL2BAN_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "${NEW_TELEMETRY_SUMMARY}"
@@ -707,7 +864,47 @@ EOF
             fi
             netplan apply
             echo -e "${GREEN}[OK]${NC} Static IP configured for interface '$INTERFACE_NAME'."
+            test_static_ip_connectivity
         fi
+    fi
+}
+
+# --- Feature 3: Post-apply Connectivity Test ---
+test_static_ip_connectivity() {
+    sleep 2  # allow interface to come up
+
+    echo -ne "${YELLOW}[TUBSS] Testing network connectivity... ${NC}"
+
+    local gw_ok=0
+    local dns_ok=0
+
+    # Ping gateway 3 attempts
+    if ping -c 3 -W 2 "$GATEWAY" > /dev/null 2>&1; then
+        echo -e "${GREEN}[OK]${NC} Gateway ${GATEWAY} is reachable."
+        gw_ok=1
+    else
+        echo -e "${YELLOW}[WARN]${NC} Gateway ${GATEWAY} did not respond to ping."
+    fi
+
+    # Test DNS resolution
+    if getent hosts google.com > /dev/null 2>&1 || nslookup google.com > /dev/null 2>&1; then
+        echo -e "${GREEN}[OK]${NC} DNS resolution is working."
+        dns_ok=1
+    else
+        echo -e "${YELLOW}[WARN]${NC} DNS resolution failed (server: ${DNS_SERVER})."
+    fi
+
+    if (( gw_ok == 0 || dns_ok == 0 )); then
+        echo ""
+        echo -e "${YELLOW}[WARN]${NC} Network connectivity check failed."
+        echo -e "${YELLOW}       If this is a remote session, you may have lost access.${NC}"
+        echo -e "${YELLOW}       To recover via console: edit /etc/netplan/01-static-network.yaml${NC}"
+        echo -e "${YELLOW}       and run: sudo netplan apply${NC}"
+        echo -e "${YELLOW}       Or to revert to DHCP: sudo rm /etc/netplan/01-static-network.yaml && sudo netplan apply${NC}"
+        echo ""
+        echo -e "${YELLOW}       Configured static IP: ${STATIC_IP}/${NETMASK_CIDR}${NC}"
+        echo -e "${YELLOW}       Gateway:               ${GATEWAY}${NC}"
+        echo -e "${YELLOW}       DNS:                   ${DNS_SERVER}${NC}"
     fi
 }
 
@@ -726,9 +923,69 @@ configure_ufw() {
             wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Enabling UFW failed (exit $?)"; exit 1; }
             echo -e "${GREEN}[OK]${NC} UFW configured and enabled."
         fi
+        # Apply custom rules (always, even if UFW was already active)
+        apply_custom_ufw_rules
     else
         echo -e "${YELLOW}[SKIPPED]${NC} UFW configuration."
     fi
+}
+
+# --- Feature 2: Apply Custom UFW Rules ---
+apply_custom_ufw_rules() {
+    if (( ${#CUSTOM_UFW_RULES[@]} == 0 )); then
+        return 0
+    fi
+
+    echo ""
+    echo -e "${YELLOW}[TUBSS] Applying custom UFW rules...${NC}"
+
+    local rule port proto dir desc
+    for rule in "${CUSTOM_UFW_RULES[@]}"; do
+        # Parse "port|protocol|direction|description"
+        IFS='|' read -r port proto dir desc <<< "$rule"
+
+        # Validate parsed values before applying
+        if [[ -z "$port" || -z "$proto" || -z "$dir" ]]; then
+            echo -e "  ${YELLOW}[SKIP]${NC} Malformed rule entry: ${rule}"
+            continue
+        fi
+
+        # Handle port ranges: stored with hyphen (e.g., 5000-5010)
+        # UFW range syntax: ufw allow 5000:5010/tcp
+        local ufw_port
+        if [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]; then
+            ufw_port="${port/-/:}"
+        else
+            ufw_port="$port"
+        fi
+
+        if [[ "$proto" == "both" ]]; then
+            if ufw status | grep -qE "^${ufw_port}/tcp"; then
+                echo -e "  ${YELLOW}[UFW]${NC} Rule for ${ufw_port}/tcp already exists — skipping."
+            elif ufw "$dir" "${ufw_port}/tcp" > /dev/null 2>&1; then
+                echo -e "  ${GREEN}[OK]${NC} ${dir} ${ufw_port}/tcp${desc:+ — ${desc}}"
+            else
+                echo -e "  ${YELLOW}[SKIP]${NC} Failed to apply: ${dir} ${ufw_port}/tcp"
+            fi
+            if ufw status | grep -qE "^${ufw_port}/udp"; then
+                echo -e "  ${YELLOW}[UFW]${NC} Rule for ${ufw_port}/udp already exists — skipping."
+            elif ufw "$dir" "${ufw_port}/udp" > /dev/null 2>&1; then
+                echo -e "  ${GREEN}[OK]${NC} ${dir} ${ufw_port}/udp${desc:+ — ${desc}}"
+            else
+                echo -e "  ${YELLOW}[SKIP]${NC} Failed to apply: ${dir} ${ufw_port}/udp"
+            fi
+        else
+            if ufw status | grep -qE "^${ufw_port}/${proto}"; then
+                echo -e "  ${YELLOW}[UFW]${NC} Rule for ${ufw_port}/${proto} already exists — skipping."
+            elif ufw "$dir" "${ufw_port}/${proto}" > /dev/null 2>&1; then
+                echo -e "  ${GREEN}[OK]${NC} ${dir} ${ufw_port}/${proto}${desc:+ — ${desc}}"
+            else
+                echo -e "  ${YELLOW}[SKIP]${NC} Failed to apply: ${dir} ${ufw_port}/${proto}"
+            fi
+        fi
+    done
+
+    echo -e "${GREEN}[OK]${NC} Custom UFW rules applied."
 }
 
 configure_fail2ban() {
@@ -844,6 +1101,7 @@ Gateway                      | ${ORIGINAL_GATEWAY:-N/A}   | ${NEW_GATEWAY_SUMMAR
 DNS Server                   | ${ORIGINAL_DNS:-N/A}       | ${NEW_DNS_SUMMARY}
 Webmin Status                | $ORIGINAL_WEBMIN_STATUS    | ${NEW_WEBMIN_SUMMARY}
 UFW Status                   | $ORIGINAL_UFW_STATUS       | ${NEW_UFW_SUMMARY}
+Custom UFW Rules             | none                       | ${#CUSTOM_UFW_RULES[@]} rule(s)
 Auto Updates Status          | $ORIGINAL_AUTO_UPDATES_STATUS | ${NEW_AUTO_UPDATES_SUMMARY}
 Fail2ban Status              | $ORIGINAL_FAIL2BAN_STATUS  | ${NEW_FAIL2BAN_SUMMARY}
 Telemetry/Analytics          | $ORIGINAL_TELEMETRY_STATUS | ${NEW_TELEMETRY_SUMMARY}
@@ -875,6 +1133,177 @@ EOF
         reboot
     else
         echo -e "${YELLOW}Reboot has been skipped. Please reboot the system manually for all changes to take effect.${NC}"
+    fi
+}
+
+# --- Feature 4: Rollback UI ---
+run_rollback_ui() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}[ERROR] Rollback requires root. Run with sudo.${NC}"
+        exit 1
+    fi
+
+    echo ""
+    echo -e "${YELLOW}+---------------------------------------------+${NC}"
+    echo -e "${YELLOW}|    T U B S S  —  Rollback / Restore        |${NC}"
+    echo -e "${YELLOW}+---------------------------------------------+${NC}"
+    echo -e "${YELLOW}|    Snapshot-Based System Recovery           |${NC}"
+    echo -e "${YELLOW}+---------------------------------------------+${NC}"
+    echo ""
+
+    local has_timeshift=0
+    local has_zfs=0
+    local has_btrfs=0
+
+    command -v timeshift > /dev/null 2>&1 && has_timeshift=1 || true
+    command -v zfs      > /dev/null 2>&1 && has_zfs=1      || true
+    command -v btrfs    > /dev/null 2>&1 && has_btrfs=1    || true
+
+    # Collect snapshots
+    local -a snap_names=()
+    local -a snap_backends=()
+
+    if (( has_timeshift )); then
+        echo -e "${YELLOW}[INFO]${NC} Scanning Timeshift snapshots..."
+        while IFS= read -r line; do
+            local snap_name
+            snap_name=$(echo "$line" | awk '{print $3}')
+            if [[ -n "$snap_name" ]]; then
+                snap_names+=("$snap_name")
+                snap_backends+=("timeshift")
+            fi
+        done < <(timeshift --list 2>/dev/null | grep -i tubss || true)
+    fi
+
+    if (( has_zfs )); then
+        echo -e "${YELLOW}[INFO]${NC} Scanning ZFS snapshots..."
+        while IFS= read -r line; do
+            local snap_name
+            snap_name=$(echo "$line" | awk '{print $1}')
+            if [[ -n "$snap_name" ]]; then
+                snap_names+=("$snap_name")
+                snap_backends+=("zfs")
+            fi
+        done < <(zfs list -t snapshot 2>/dev/null | grep -i tubss || true)
+    fi
+
+    if (( has_btrfs )); then
+        echo -e "${YELLOW}[INFO]${NC} Scanning Btrfs subvolumes..."
+        while IFS= read -r line; do
+            local snap_name
+            snap_name=$(echo "$line" | awk '{print $NF}')
+            if [[ -n "$snap_name" ]]; then
+                snap_names+=("$snap_name")
+                snap_backends+=("btrfs")
+            fi
+        done < <(btrfs subvolume list / 2>/dev/null | grep -i tubss || true)
+    fi
+
+    if (( ${#snap_names[@]} == 0 )); then
+        echo ""
+        echo -e "${YELLOW}[INFO]${NC} No TUBSS-tagged snapshots found on this system."
+        echo -e "       Create a snapshot during setup by answering 'yes' to the snapshot prompt."
+        echo ""
+        return 0
+    fi
+
+    # Display numbered list
+    echo ""
+    echo -e "${YELLOW}Available TUBSS snapshots:${NC}"
+    local i
+    for (( i=0; i<${#snap_names[@]}; i++ )); do
+        printf "  [%d] %-50s  (backend: %s)\n" "$(( i+1 ))" "${snap_names[$i]}" "${snap_backends[$i]}"
+    done
+    echo ""
+
+    # Prompt user to select
+    local selection
+    while true; do
+        read -p "Select a snapshot to restore (1-${#snap_names[@]}, or 0 to cancel): " selection
+        if [[ "$selection" == "0" ]]; then
+            echo -e "${YELLOW}Rollback cancelled.${NC}"
+            return 0
+        fi
+        if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection >= 1 && selection <= ${#snap_names[@]} )); then
+            break
+        else
+            echo -e "${RED}Invalid selection. Enter a number between 1 and ${#snap_names[@]}, or 0 to cancel.${NC}"
+        fi
+    done
+
+    local chosen_name="${snap_names[$(( selection - 1 ))]}"
+    local chosen_backend="${snap_backends[$(( selection - 1 ))]}"
+
+    echo ""
+    read -p "Restore to '${chosen_name}'? This cannot be undone. (yes/no) [no]: " confirm_restore
+    confirm_restore=${confirm_restore:-no}
+    confirm_restore=$(echo "$confirm_restore" | tr '[:upper:]' '[:lower:]')
+
+    if [[ ! "$confirm_restore" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        echo -e "${YELLOW}Rollback cancelled.${NC}"
+        return 0
+    fi
+
+    echo ""
+    case "$chosen_backend" in
+        timeshift)
+            echo -e "${YELLOW}[INFO]${NC} Restoring Timeshift snapshot: ${chosen_name}"
+            timeshift --restore --snapshot "${chosen_name}" --yes
+            echo -e "${GREEN}[OK]${NC} Timeshift restore initiated. A system reboot is required."
+            ;;
+        zfs)
+            echo -e "${YELLOW}[INFO]${NC} Checking for intermediate ZFS snapshots..."
+            local dataset snap_short intermediate_count
+            dataset=$(echo "$chosen_name" | cut -d@ -f1)
+            snap_short=$(echo "$chosen_name" | cut -d@ -f2)
+            # Count snapshots created after the chosen one on the same dataset
+            intermediate_count=$(zfs list -t snapshot -H -o name "$dataset" 2>/dev/null \
+                | awk -v target="$chosen_name" 'found{count++} $0==target{found=1} END{print count+0}' || echo "0")
+
+            if (( intermediate_count > 0 )); then
+                echo -e "${YELLOW}[WARN]${NC} ${intermediate_count} snapshot(s) exist after '${chosen_name}'."
+                echo -e "${YELLOW}       ZFS rollback requires destroying intermediate snapshots.${NC}"
+                echo -e "${YELLOW}       To proceed manually, run:${NC}"
+                echo -e "         sudo zfs rollback -r ${chosen_name}"
+                echo -e "${YELLOW}       WARNING: -r will destroy all snapshots newer than the target.${NC}"
+            else
+                echo -e "${YELLOW}[INFO]${NC} No intermediate snapshots detected. Proceeding with rollback..."
+                zfs rollback "${chosen_name}"
+                echo -e "${GREEN}[OK]${NC} ZFS rollback complete. A system reboot is required."
+            fi
+            ;;
+        btrfs)
+            echo -e "${YELLOW}[WARN]${NC} Btrfs live rollback is not executed automatically due to the risk of data loss."
+            echo -e "${YELLOW}       To restore manually, boot from a live environment and run:${NC}"
+            echo ""
+            echo -e "         # Mount the Btrfs volume"
+            echo -e "         sudo mount /dev/sdXY /mnt"
+            echo -e ""
+            echo -e "         # Move the current root subvolume aside"
+            echo -e "         sudo mv /mnt/@ /mnt/@.broken"
+            echo -e ""
+            echo -e "         # Create a read-write snapshot from the TUBSS snapshot"
+            echo -e "         sudo btrfs subvolume snapshot /mnt/@snapshots/${chosen_name} /mnt/@"
+            echo -e ""
+            echo -e "         # Unmount and reboot"
+            echo -e "         sudo umount /mnt && sudo reboot"
+            echo ""
+            echo -e "${YELLOW}[INFO]${NC} No changes have been made to your system."
+            ;;
+        *)
+            echo -e "${RED}[ERROR]${NC} Unknown backend '${chosen_backend}'. No action taken."
+            ;;
+    esac
+
+    echo ""
+    echo -e "${YELLOW}[INFO]${NC} Reboot is required for the restore to take full effect."
+    read -p "Would you like to reboot now? (yes/no) [no]: " do_reboot
+    do_reboot=${do_reboot:-no}
+    if [[ "$do_reboot" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        echo -e "${YELLOW}Rebooting...${NC}"
+        reboot
+    else
+        echo -e "${YELLOW}Please reboot manually when ready.${NC}"
     fi
 }
 
