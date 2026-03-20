@@ -793,7 +793,7 @@ configure_auto_updates() {
 disable_telemetry() {
     if [[ "$DISABLE_TELEMETRY" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -ne "${YELLOW}[TUBSS] Disabling Ubuntu Telemetry... ${NC}"
-        if grep -q "enabled: false" /etc/ubuntu-report/ubuntu-report.conf 2>/dev/null; then
+        if grep -q "^enable = false" /etc/ubuntu-report/ubuntu-report.conf 2>/dev/null; then
             echo -e "  ${GREEN}[SKIP]${NC} Telemetry already disabled"
         elif [ -f /etc/ubuntu-report/ubuntu-report.conf ]; then
             sed -i 's/^enable = true/enable = false/' /etc/ubuntu-report/ubuntu-report.conf

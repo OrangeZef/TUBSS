@@ -28,7 +28,7 @@ run_test() {
     echo "[2/4] Syntax check..."
     docker run --rm "$image" bash -n /usr/local/bin/tubss_setup.sh \
         && echo "  Syntax: OK" \
-        || { echo "  Syntax: FAIL"; ((failed++)); return; }
+        || { echo "  Syntax: FAIL"; failed=$((failed + 1)); return; }
 
     echo "[3/4] Shellcheck (if available)..."
     docker run --rm "$image" bash -c \
@@ -41,10 +41,10 @@ run_test() {
         apt-get update -qq && apt-get install -y --dry-run \
             curl ufw unattended-upgrades apparmor net-tools htop vim build-essential rsync \
             > /dev/null 2>&1 && echo '  Package resolution: OK'
-    " || { echo "  Package dry-run: FAIL"; ((failed++)); return; }
+    " || { echo "  Package dry-run: FAIL"; failed=$((failed + 1)); return; }
 
     echo "Ubuntu ${version}: PASS"
-    ((passed++))
+    passed=$((passed + 1))
 }
 
 run_test "24.04" "$SCRIPT_DIR/Dockerfile"
