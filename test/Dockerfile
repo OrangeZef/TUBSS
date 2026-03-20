@@ -1,0 +1,25 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV container=docker
+
+RUN apt-get update && apt-get install -y \
+    systemd \
+    systemd-sysv \
+    curl \
+    sudo \
+    ufw \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /lib/systemd/system/multi-user.target.wants/* \
+    /etc/systemd/system/*.wants/* \
+    /lib/systemd/system/local-fs.target.wants/* \
+    /lib/systemd/system/sockets.target.wants/*udev* \
+    /lib/systemd/system/sockets.target.wants/*initctl* \
+    /lib/systemd/system/basic.target.wants/* || true
+
+COPY tubss_setup.sh /usr/local/bin/tubss_setup.sh
+RUN chmod +x /usr/local/bin/tubss_setup.sh
+
+VOLUME ["/sys/fs/cgroup"]
+CMD ["/lib/systemd/systemd"]

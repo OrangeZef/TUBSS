@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 #==============================================================================
 # TUBSS Launcher Script
@@ -17,12 +18,6 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
-# Define the URL for the raw script on GitHub
-TUBSS_URL="https://raw.githubusercontent.com/OrangeZef/TUBSS/main/tubss_setup.sh"
-
-# Define a temporary file path for the downloaded script
-TEMP_SCRIPT="/tmp/tubss_setup_temp_$(date +%s).sh"
-
 # --- Function to display an error and exit gracefully ---
 handle_error() {
     local exit_code=$?
@@ -30,10 +25,6 @@ handle_error() {
     echo -e "${RED}An error occurred. The script could not be downloaded or executed.${NC}"
     echo -e "${RED}Exit Code: ${exit_code}${NC}"
     echo -e "${RED}--------------------------------------------------------${NC}"
-    # Clean up the temporary file if it exists
-    if [ -f "$TEMP_SCRIPT" ]; then
-        rm "$TEMP_SCRIPT"
-    fi
     exit 1
 }
 
@@ -47,25 +38,48 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Detect Ubuntu version early
+VERSION_ID=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
+
 # Display a friendly welcome message
 echo -e "${YELLOW}============================================================${NC}"
 echo -e "${YELLOW}  Welcome to the TUBSS Launcher!${NC}"
 echo -e "${YELLOW}  This script will download the latest version of TUBSS.${NC}"
 echo -e "${YELLOW}============================================================${NC}"
 echo ""
+echo -e "${GREEN}[INFO]${NC} Detected Ubuntu version: ${VERSION_ID}"
+echo ""
 
 # --- Ask for user confirmation before proceeding ---
-read -p "Are you sure you want to download and run the TUBSS setup script? (yes/no) [yes]: " CONFIRM_RUN
-CONFIRM_RUN=${CONFIRM_RUN:-yes}
-CONFIRM_RUN=$(echo "$CONFIRM_RUN" | tr '[:upper:]' '[:lower:]')
-
-if [[ "$CONFIRM_RUN" != "yes" ]]; then
-    echo -e "${RED}Execution aborted by user.${NC}"
+read -rp "Proceed? [y/N]: " confirm
+confirm="${confirm,,}"  # lowercase
+if [[ "$confirm" != "y" && "$confirm" != "yes" ]]; then
+    echo -e "${YELLOW}Aborted.${NC}"
     exit 0
 fi
 
 echo ""
 echo -e "${YELLOW}Starting download...${NC}"
+
+# Build download URL — try version-specific first, fall back to main
+BASE_URL="https://raw.githubusercontent.com/OrangeZef/TUBSS/main"
+VERSION_URL="${BASE_URL}/versions/${VERSION_ID}/tubss_setup.sh"
+FALLBACK_URL="${BASE_URL}/tubss_setup.sh"
+
+# Use mktemp for an unpredictable temp filename
+TEMP_SCRIPT=$(mktemp /tmp/tubss_setup.XXXXXX.sh)
+
+# Register EXIT trap to clean up temp files
+trap 'rm -f "$TEMP_SCRIPT"' EXIT
+
+# Check if version-specific script exists
+if curl --silent --fail --head "$VERSION_URL" > /dev/null 2>&1; then
+    DOWNLOAD_URL="$VERSION_URL"
+    echo -e "${GREEN}[INFO]${NC} Found Ubuntu ${VERSION_ID}-specific setup script"
+else
+    DOWNLOAD_URL="$FALLBACK_URL"
+    echo -e "${YELLOW}[WARN]${NC} No Ubuntu ${VERSION_ID}-specific script found, using default"
+fi
 
 # --- Download the script securely using curl ---
 # The -s option makes curl silent.
@@ -73,19 +87,35 @@ echo -e "${YELLOW}Starting download...${NC}"
 # The -S option shows an error message even with -s.
 # The -L option follows redirects.
 # -o specifies the output file.
-if ! curl -fsSL "$TUBSS_URL" -o "$TEMP_SCRIPT"; then
+if ! curl -fsSL "$DOWNLOAD_URL" -o "$TEMP_SCRIPT"; then
     echo -e "${RED}Error: Failed to download the TUBSS script from GitHub.${NC}"
     exit 1
 fi
 
 echo -e "${GREEN}[OK]${NC} Download successful."
 
+# --- Download SHA256 checksum and verify if available ---
+CHECKSUM_URL="${DOWNLOAD_URL%.sh}.sha256"
+TEMP_CHECKSUM=$(mktemp /tmp/tubss_checksum.XXXXXX)
+
+if curl --silent --fail "$CHECKSUM_URL" -o "$TEMP_CHECKSUM" 2>/dev/null; then
+    echo -e "${GREEN}[INFO]${NC} Verifying script integrity..."
+    # Adjust the checksum file to match temp path
+    sed -i "s|tubss_setup.sh|${TEMP_SCRIPT}|g" "$TEMP_CHECKSUM"
+    if sha256sum -c "$TEMP_CHECKSUM" > /dev/null 2>&1; then
+        echo -e "${GREEN}[OK]${NC} Integrity check passed"
+    else
+        echo -e "${RED}[ERROR]${NC} Integrity check FAILED — aborting for security"
+        rm -f "$TEMP_SCRIPT" "$TEMP_CHECKSUM"
+        exit 1
+    fi
+else
+    echo -e "${YELLOW}[WARN]${NC} No checksum file available — skipping verification"
+fi
+rm -f "$TEMP_CHECKSUM"
+
 # --- Run the downloaded script with the current shell ---
 echo -e "${YELLOW}Executing the TUBSS setup script now...${NC}"
 
-# Use 'bash' to run the temporary script with the current user's privileges (which are root via sudo)
-# Use 'exec' to replace the current process with the new script, preventing double-prompting for sudo.
-if ! exec bash "$TEMP_SCRIPT"; then
-    echo -e "${RED}Error: Failed to execute the TUBSS setup script.${NC}"
-    exit 1
-fi
+bash "$TEMP_SCRIPT"
+exit $?
