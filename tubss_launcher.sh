@@ -98,19 +98,21 @@ echo -e "${GREEN}[OK]${NC} Download successful."
 CHECKSUM_URL="${DOWNLOAD_URL%.sh}.sha256"
 TEMP_CHECKSUM=$(mktemp /tmp/tubss_checksum.XXXXXX)
 
-if curl --silent --fail "$CHECKSUM_URL" -o "$TEMP_CHECKSUM" 2>/dev/null; then
-    echo -e "${GREEN}[INFO]${NC} Verifying script integrity..."
-    # Adjust the checksum file to match temp path
-    sed -i "s|tubss_setup.sh|${TEMP_SCRIPT}|g" "$TEMP_CHECKSUM"
-    if sha256sum -c "$TEMP_CHECKSUM" > /dev/null 2>&1; then
-        echo -e "${GREEN}[OK]${NC} Integrity check passed"
-    else
-        echo -e "${RED}[ERROR]${NC} Integrity check FAILED — aborting for security"
-        rm -f "$TEMP_SCRIPT" "$TEMP_CHECKSUM"
-        exit 1
-    fi
+curl --silent --fail "$CHECKSUM_URL" -o "$TEMP_CHECKSUM" 2>/dev/null || true
+if [[ ! -s "$TEMP_CHECKSUM" ]]; then
+    echo -e "${RED}[ERROR] SHA256 checksum file not found at remote. Cannot verify integrity. Aborting.${NC}"
+    rm -f "$TEMP_SCRIPT" "$TEMP_CHECKSUM"
+    exit 1
+fi
+echo -e "${GREEN}[INFO]${NC} Verifying script integrity..."
+# Adjust the checksum file to match temp path
+sed -i "s|tubss_setup.sh|${TEMP_SCRIPT}|g" "$TEMP_CHECKSUM"
+if sha256sum -c "$TEMP_CHECKSUM" > /dev/null 2>&1; then
+    echo -e "${GREEN}[OK]${NC} Integrity check passed"
 else
-    echo -e "${YELLOW}[WARN]${NC} No checksum file available — skipping verification"
+    echo -e "${RED}[ERROR]${NC} Integrity check FAILED — aborting for security"
+    rm -f "$TEMP_SCRIPT" "$TEMP_CHECKSUM"
+    exit 1
 fi
 rm -f "$TEMP_CHECKSUM"
 

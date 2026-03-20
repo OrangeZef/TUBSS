@@ -119,9 +119,15 @@ CUSTOM_UFW_RULES=()
 # --- Pre-flight state ---
 PREFLIGHT_FAILED=0
 
+# --- Package installation state (used by cleanup guard) ---
+PACKAGES_INSTALLED=0
+
 # --- Version detection globals (set by run_preflight, read by run_prereqs) ---
 DETECTED_VERSION=""
 SUPPORTED_VERSIONS=("20.04" "22.04" "24.04")
+
+# --- Network globals (safe defaults to avoid unbound variable under set -u) ---
+ORIGINAL_IP=""
 
 
 # --- Utility Functions ---
@@ -181,10 +187,12 @@ cleanup() {
     echo -e "${YELLOW}============================================================${NC}"
     echo -e "${YELLOW}                  Final Cleanup and Exit${NC}"
     echo -e "${YELLOW}============================================================${NC}"
-    apt-get autoremove -y > /dev/null 2>&1 &
-    bg_pid=$!
-    spinner $bg_pid "Removing unused packages"
-    wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Removing unused packages failed (exit $?)"; exit 1; }
+    if (( PACKAGES_INSTALLED == 1 )); then
+        apt-get autoremove -y > /dev/null 2>&1 &
+        bg_pid=$!
+        spinner $bg_pid "Removing unused packages"
+        wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Removing unused packages failed (exit $?)"; exit 1; }
+    fi
     echo -e "${GREEN}[OK]${NC} Cleanup complete."
     # Revert terminal colors
     echo -e "${NC}\033[0m"
@@ -806,7 +814,7 @@ install_packages() {
     if [[ "$INSTALL_SMB" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("cifs-utils"); fi
 
     for pkg in "${PACKAGES[@]}"; do
-        if dpkg -l "$pkg" &>/dev/null; then
+        if dpkg -l "$pkg" 2>/dev/null | grep -qE '^ii'; then
             echo -e "  ${GREEN}[SKIP]${NC} $pkg already installed"
         else
             packages_to_install+=("$pkg")
@@ -823,6 +831,7 @@ install_packages() {
     else
         echo -e "  ${GREEN}[SKIP]${NC} All packages already installed"
     fi
+    PACKAGES_INSTALLED=1
 }
 
 configure_network() {
@@ -1067,7 +1076,7 @@ join_ad_domain() {
     if [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -ne "${YELLOW}[TUBSS] Joining Active Directory domain... ${NC}"
         echo -e "${YELLOW}Placeholder: Domain join logic is not implemented in this script due to security concerns.${NC}"
-        unset AD_PASSWORD
+        unset AD_PASSWORD AD_DOMAIN AD_USER
     else
         echo -e "${YELLOW}[SKIPPED]${NC} AD domain join."
     fi
