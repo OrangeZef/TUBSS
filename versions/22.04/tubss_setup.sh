@@ -33,6 +33,12 @@
 # - [v2.4] Added collect_custom_ufw_rules() and apply_custom_ufw_rules() for user-defined firewall rules.
 # - [v2.4] Added test_static_ip_connectivity() for post-apply network validation.
 # - [v2.4] Added run_rollback_ui() and --rollback flag for snapshot-based system recovery.
+# - [v2.5] Added run-state persistence (init/update/mark/finalize) with display at preflight.
+# - [v2.5] Fixed DHCP restore path — restore_dhcp_config() restores backup or writes minimal fallback.
+# - [v2.5] Added second-run skip warning for static netplan config.
+# - [v2.5] Added disable_cloud_init_network() to prevent cloud-init from overwriting managed netplan.
+# - [v2.5] Timestamped backup subdirectory for netplan conflict backups.
+# - [v2.5] Replaced test_static_ip_connectivity() with warn_if_gateway_unreachable() pre-write check.
 #
 # Provided by Joka.ca
 #==============================================================================
@@ -56,7 +62,7 @@ BANNER_ART="
 |    T U B S S                                |
 +---------------------------------------------+
 |    The Ubuntu Basic Setup Script            |
-|    Version 2.4                              |
+|    Version 2.5                              |
 +---------------------------------------------+
 |    Provided by Joka.ca                      |
 +---------------------------------------------+
@@ -129,12 +135,20 @@ SUPPORTED_VERSIONS=("20.04" "22.04" "24.04")
 # --- Network globals (safe defaults to avoid unbound variable under set -u) ---
 ORIGINAL_IP=""
 
+# --- Run-state persistence ---
+TUBSS_SCRIPT_VERSION="2.5"
+TUBSS_STATE_DIR="/var/lib/tubss"
+TUBSS_STATE_FILE="/var/lib/tubss/last_run"
+CURRENT_STEP=""
+DHCP_RESTORE_FILE=""
+
 
 # --- Utility Functions ---
 
 # Function to handle errors and exit gracefully
 handle_error() {
     local exit_code=$?
+    mark_run_state_failed "${CURRENT_STEP:-unknown}"
     local line_number=${BASH_LINENO[0]}
     local command=${BASH_COMMAND}
     echo ""
@@ -238,6 +252,7 @@ main() {
 
 # --- Step 0: Pre-flight Validation ---
 run_preflight() {
+    display_prior_run_state
     echo ""
     echo -e "${YELLOW}============================================================${NC}"
     echo -e "${YELLOW}              [PREFLIGHT] System Checks${NC}"
@@ -725,29 +740,120 @@ show_summary_and_confirm() {
     echo -e "--------------------------------------------------------"
 }
 
+# --- Run State Persistence ---
+
+display_prior_run_state() {
+    [[ ! -f "$TUBSS_STATE_FILE" ]] && return 0
+
+    local ver start end status last_step failed_step host
+    ver=$(grep "^TUBSS_VERSION=" "$TUBSS_STATE_FILE" | cut -d= -f2)
+    start=$(grep "^RUN_START=" "$TUBSS_STATE_FILE" | cut -d= -f2)
+    end=$(grep "^RUN_END=" "$TUBSS_STATE_FILE" | cut -d= -f2)
+    status=$(grep "^STATUS=" "$TUBSS_STATE_FILE" | cut -d= -f2)
+    last_step=$(grep "^LAST_STEP=" "$TUBSS_STATE_FILE" | cut -d= -f2)
+    failed_step=$(grep "^FAILED_STEP=" "$TUBSS_STATE_FILE" | cut -d= -f2)
+    host=$(grep "^HOSTNAME=" "$TUBSS_STATE_FILE" | cut -d= -f2)
+
+    echo ""
+    echo -e "============================================================"
+    echo -e "                   Prior Run State"
+    echo -e "============================================================"
+    echo -e "  Last run:    ${start:-unknown}"
+    if [[ "$status" == "completed" ]]; then
+        echo -e "  Status:      ${GREEN}completed${NC}"
+        echo -e "  Finished:    ${end:-unknown}"
+    elif [[ "$status" == "failed" ]]; then
+        if [[ -n "$failed_step" ]]; then
+            echo -e "  Status:      ${RED}failed${NC}"
+            echo -e "  Failed step: ${failed_step}"
+        else
+            echo -e "  Status:      ${YELLOW}interrupted or failed${NC}"
+            echo -e "  Last step:   ${last_step:-none completed}"
+        fi
+    elif [[ "$status" == "running" ]]; then
+        echo -e "  Status:      ${YELLOW}running${NC} (interrupted — did not finish)"
+        echo -e "  Last step:   ${last_step:-none}"
+    else
+        echo -e "  Status:      ${status:-unknown}"
+    fi
+    echo -e "  Script ver:  ${ver:-unknown}"
+    echo -e "  Hostname:    ${host:-unknown}"
+    echo -e "============================================================"
+    echo ""
+}
+
+init_run_state() {
+    mkdir -p "$TUBSS_STATE_DIR"
+    cat > "$TUBSS_STATE_FILE" << EOF
+TUBSS_VERSION=${TUBSS_SCRIPT_VERSION}
+RUN_START=$(date -Iseconds)
+RUN_END=
+STATUS=failed
+LAST_STEP=
+FAILED_STEP=
+HOSTNAME=${HOSTNAME:-$(hostname)}
+NET_TYPE=${NET_TYPE:-unknown}
+EOF
+}
+
+update_run_state_step() {
+    [[ ! -f "$TUBSS_STATE_FILE" ]] && return 0
+    sed -i "s|^LAST_STEP=.*|LAST_STEP=${1}|" "$TUBSS_STATE_FILE"
+}
+
+mark_run_state_failed() {
+    [[ ! -f "$TUBSS_STATE_FILE" ]] && return 0
+    sed -i "s|^STATUS=.*|STATUS=failed|" "$TUBSS_STATE_FILE"
+    sed -i "s|^FAILED_STEP=.*|FAILED_STEP=${1}|" "$TUBSS_STATE_FILE"
+}
+
+finalize_run_state() {
+    [[ ! -f "$TUBSS_STATE_FILE" ]] && return 0
+    sed -i "s|^STATUS=.*|STATUS=completed|" "$TUBSS_STATE_FILE"
+    sed -i "s|^RUN_END=.*|RUN_END=$(date -Iseconds)|" "$TUBSS_STATE_FILE"
+}
+
 # --- Step 4: Apply Configuration ---
 apply_configuration() {
-    # Filesystem Snapshot
+    init_run_state
+
+    CURRENT_STEP="configure_snapshot"
     configure_snapshot
+    update_run_state_step "configure_snapshot"
 
-    # Hostname Configuration
+    CURRENT_STEP="configure_hostname"
     configure_hostname
+    update_run_state_step "configure_hostname"
 
-    # Package Installation
+    CURRENT_STEP="install_packages"
     install_packages
+    update_run_state_step "install_packages"
 
-    # Network Configuration
-    configure_network
-
-    # Security Configuration — UFW must come before Fail2ban
-    # because Fail2ban uses banaction=ufw and requires UFW to be active first
+    CURRENT_STEP="configure_ufw"
     configure_ufw
-    configure_fail2ban
-    configure_auto_updates
-    disable_telemetry
+    update_run_state_step "configure_ufw"
 
-    # Domain Join and File Shares
+    CURRENT_STEP="configure_fail2ban"
+    configure_fail2ban
+    update_run_state_step "configure_fail2ban"
+
+    CURRENT_STEP="configure_auto_updates"
+    configure_auto_updates
+    update_run_state_step "configure_auto_updates"
+
+    CURRENT_STEP="disable_telemetry"
+    disable_telemetry
+    update_run_state_step "disable_telemetry"
+
+    CURRENT_STEP="join_ad_domain"
     join_ad_domain
+    update_run_state_step "join_ad_domain"
+
+    # Network Configuration — done last so all other steps complete before
+    # the network changes on reboot
+    CURRENT_STEP="configure_network"
+    configure_network
+    update_run_state_step "configure_network"
 }
 
 configure_snapshot() {
@@ -834,26 +940,106 @@ install_packages() {
     PACKAGES_INSTALLED=1
 }
 
+disable_cloud_init_network() {
+    local cloud_cfg_dir="/etc/cloud/cloud.cfg.d"
+    local tubss_override="${cloud_cfg_dir}/99-tubss-disable-network.cfg"
+
+    if [[ ! -d "$cloud_cfg_dir" ]]; then
+        return 0
+    fi
+
+    if grep -qs "config: disabled" "${cloud_cfg_dir}"/*.cfg 2>/dev/null; then
+        echo -e "  ${GREEN}[SKIP]${NC} Cloud-init network management already disabled."
+        return 0
+    fi
+
+    cat > "$tubss_override" << EOF
+# Written by TUBSS v${TUBSS_SCRIPT_VERSION} to prevent cloud-init from
+# overwriting TUBSS-managed netplan configuration on reboot.
+network:
+  config: disabled
+EOF
+    echo -e "  ${YELLOW}[CLOUD-INIT]${NC} Disabled cloud-init network management: ${tubss_override}"
+}
+
+restore_dhcp_config() {
+    local target_config_file="$1"
+    local most_recent active_iface iface_to_use
+
+    # Try to restore a previously backed-up DHCP config
+    most_recent=$(find /etc/netplan/tubss-backup/ -maxdepth 2 \
+        \( -name "*.yaml" -o -name "*.yml" \) \
+        -printf "%T@ %p\n" 2>/dev/null \
+        | sort -rn | head -1 | awk '{print $2}')
+
+    if [[ -n "$most_recent" ]]; then
+        cp "$most_recent" /etc/netplan/
+        DHCP_RESTORE_FILE="/etc/netplan/$(basename "$most_recent")"
+        echo -e "  ${YELLOW}[NETPLAN]${NC} Restored backup config: $(basename "$most_recent")"
+        return 0
+    fi
+
+    # No backup found — check if any other netplan config exists
+    local other_config
+    other_config=$(find /etc/netplan/ -maxdepth 1 \( -name "*.yaml" -o -name "*.yml" \) \
+        ! -name "$(basename "$target_config_file")" 2>/dev/null | head -1)
+    if [[ -n "$other_config" ]]; then
+        # Other configs exist that will handle DHCP — nothing to write
+        return 0
+    fi
+
+    # Last resort: write a minimal DHCP fallback
+    active_iface=$(ip -o -4 a | awk '{print $2}' | grep -v lo | head -1)
+    iface_to_use="${INTERFACE_NAME:-${active_iface:-eth0}}"
+    cat > /etc/netplan/99-tubss-dhcp.yaml << EOF
+network:
+  version: 2
+  ethernets:
+    ${iface_to_use}:
+      dhcp4: true
+EOF
+    DHCP_RESTORE_FILE="/etc/netplan/99-tubss-dhcp.yaml"
+    echo -e "  ${YELLOW}[NETPLAN]${NC} No backup found — wrote minimal DHCP config for '${iface_to_use}'."
+}
+
 configure_network() {
     local network_config_file
     echo -ne "${YELLOW}[TUBSS] Configuring Network... ${NC}"
     network_config_file="/etc/netplan/01-static-network.yaml"
     if [[ "$NET_TYPE" == "dhcp" ]]; then
         if [ -f "$network_config_file" ]; then
-            rm -f "$network_config_file"
+            DHCP_RESTORE_FILE=""
+            restore_dhcp_config "$network_config_file"
+            local static_temp="/tmp/tubss-static-rollback.yaml"
+            mv "$network_config_file" "$static_temp"
             if ! netplan generate > /dev/null 2>&1; then
-                echo -e "${RED}[ERROR]${NC} Netplan configuration validation failed — not applying to avoid network lockout"
+                mv "$static_temp" "$network_config_file"
+                [[ -n "$DHCP_RESTORE_FILE" ]] && rm -f "$DHCP_RESTORE_FILE"
+                echo -e "${RED}[ERROR]${NC} Netplan configuration validation failed — rolled back to static config"
                 exit 1
             fi
-            netplan apply
-            echo -e "${GREEN}[OK]${NC} Switched to DHCP."
+            rm -f "$static_temp"
+            echo -e "${GREEN}[OK]${NC} DHCP config restored — will apply on reboot."
         else
             echo -e "${YELLOW}[SKIPPED]${NC} Already using DHCP."
         fi
     else
         if [[ -f "$network_config_file" ]]; then
-            echo -e "  ${GREEN}[SKIP]${NC} Static network config already exists — skipping (delete to reconfigure)"
+            echo -e "  ${GREEN}[SKIP]${NC} Static network config already exists — skipping."
+            echo -e "  ${YELLOW}[WARN]${NC} If you added netplan files since the last run, delete /etc/netplan/01-static-network.yaml and re-run to trigger cleanup."
         else
+            warn_if_gateway_unreachable
+            # Backup and remove conflicting netplan configs to prevent IP merging
+            local backup_timestamp
+            backup_timestamp=$(date +%Y%m%d-%H%M%S)
+            local backup_dir="/etc/netplan/tubss-backup/${backup_timestamp}"
+            mkdir -p "$backup_dir"
+            for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+                [[ -f "$f" ]] || continue
+                [[ "$f" == "$network_config_file" ]] && continue
+                mv "$f" "$backup_dir/"
+                echo -e "  ${YELLOW}[NETPLAN]${NC} Backed up conflicting config: $(basename "$f")"
+            done
             cat << EOF > "$network_config_file"
 network:
   version: 2
@@ -871,50 +1057,27 @@ EOF
                 echo -e "${RED}[ERROR]${NC} Netplan configuration validation failed — not applying to avoid network lockout"
                 exit 1
             fi
-            netplan apply
-            echo -e "${GREEN}[OK]${NC} Static IP configured for interface '$INTERFACE_NAME'."
-            test_static_ip_connectivity
+            disable_cloud_init_network
+            echo -e "${GREEN}[OK]${NC} Static IP config written for '$INTERFACE_NAME' — will apply on reboot."
         fi
     fi
 }
 
-# --- Feature 3: Post-apply Connectivity Test ---
-test_static_ip_connectivity() {
-    sleep 2  # allow interface to come up
+# --- Feature 3: Pre-write Gateway Reachability Check ---
+warn_if_gateway_unreachable() {
+    [[ "$NET_TYPE" != "static" ]] && return 0
+    [[ -z "${GATEWAY:-}" ]] && return 0
 
-    echo -ne "${YELLOW}[TUBSS] Testing network connectivity... ${NC}"
-
-    local gw_ok=0
-    local dns_ok=0
-
-    # Ping gateway 3 attempts
-    if ping -c 3 -W 2 "$GATEWAY" > /dev/null 2>&1; then
+    echo -ne "${YELLOW}[TUBSS] Checking gateway reachability before writing config... ${NC}"
+    if ping -c 2 -W 2 "$GATEWAY" > /dev/null 2>&1; then
         echo -e "${GREEN}[OK]${NC} Gateway ${GATEWAY} is reachable."
-        gw_ok=1
     else
+        echo ""
         echo -e "${YELLOW}[WARN]${NC} Gateway ${GATEWAY} did not respond to ping."
+        echo -e "${YELLOW}       This may indicate the gateway IP is incorrect.${NC}"
+        echo -e "${YELLOW}       Proceeding anyway — double-check your network settings.${NC}"
     fi
-
-    # Test DNS resolution
-    if getent hosts google.com > /dev/null 2>&1 || nslookup google.com > /dev/null 2>&1; then
-        echo -e "${GREEN}[OK]${NC} DNS resolution is working."
-        dns_ok=1
-    else
-        echo -e "${YELLOW}[WARN]${NC} DNS resolution failed (server: ${DNS_SERVER})."
-    fi
-
-    if (( gw_ok == 0 || dns_ok == 0 )); then
-        echo ""
-        echo -e "${YELLOW}[WARN]${NC} Network connectivity check failed."
-        echo -e "${YELLOW}       If this is a remote session, you may have lost access.${NC}"
-        echo -e "${YELLOW}       To recover via console: edit /etc/netplan/01-static-network.yaml${NC}"
-        echo -e "${YELLOW}       and run: sudo netplan apply${NC}"
-        echo -e "${YELLOW}       Or to revert to DHCP: sudo rm /etc/netplan/01-static-network.yaml && sudo netplan apply${NC}"
-        echo ""
-        echo -e "${YELLOW}       Configured static IP: ${STATIC_IP}/${NETMASK_CIDR}${NC}"
-        echo -e "${YELLOW}       Gateway:               ${GATEWAY}${NC}"
-        echo -e "${YELLOW}       DNS:                   ${DNS_SERVER}${NC}"
-    fi
+    return 0
 }
 
 configure_ufw() {
@@ -1084,6 +1247,7 @@ join_ad_domain() {
 
 # --- Step 5: Final Summary and Reboot Prompt ---
 reboot_prompt() {
+    finalize_run_state
     echo ""
     echo -e "${YELLOW}Configuration changes have been applied.${NC}"
     echo "A summary of the changes has been saved to: $SUMMARY_FILE"
