@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - '**/tubss_setup.sh'
+  workflow_dispatch:
 
 jobs:
   update-checksums:

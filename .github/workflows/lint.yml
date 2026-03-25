@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - '**.sh'
+  workflow_dispatch:
 
 jobs:
   lint:
