@@ -334,10 +334,12 @@ run_prereqs() {
     else
         ORIGINAL_IP=$ORIGINAL_IP_CIDR
         ORIGINAL_NETMASK_CIDR="24"
-        # shellcheck disable=SC2034 — stored for potential future use in a restore/summary display; not read elsewhere currently
+        # shellcheck disable=SC2034
+        # Stored for potential future use in a restore/summary display; not read elsewhere currently
         ORIGINAL_NETMASK="255.255.255.0"
     fi
-    # shellcheck disable=SC2034 — stored for potential future use in restore/display logic; interface selection uses INTERFACE_NAME instead
+    # shellcheck disable=SC2034
+    # Stored for potential future use in restore/display logic; interface selection uses INTERFACE_NAME instead
     ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
     ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
     if grep -q "dhcp4: true" /etc/netplan/* &>/dev/null; then
@@ -595,7 +597,8 @@ get_user_configuration() {
 
 
     # AD details if requested
-    # shellcheck disable=SC2034 — AD_DOMAIN, AD_USER, AD_PASSWORD are reserved for future AD join implementation;
+    # shellcheck disable=SC2034
+    # AD_DOMAIN, AD_USER, AD_PASSWORD are reserved for future AD join implementation;
     # they are read into globals here and unset in join_ad_domain() for credential hygiene.
     if [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo ""
@@ -940,7 +943,7 @@ install_packages() {
 
     if [[ ${#packages_to_install[@]} -gt 0 ]]; then
         echo -ne "${YELLOW}[TUBSS] Installing packages...${NC}"
-        apt-get install -y "${packages_to_install[@]}" > /dev/null 2>&1 &
+        NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages_to_install[@]}" > /dev/null 2>&1 &
         bg_pid=$!
         spinner $bg_pid "Installing packages"
         wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Installing packages failed (exit $?)"; exit 1; }
