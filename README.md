@@ -25,3 +25,13 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/OrangeZef/tubss/mai
 Setting up a new server is often repetitive and time-consuming. TUBSS standardizes the process, reduces human error, and ensures every server starts with a secure and well-documented base. It’s ideal for developers, system administrators, and anyone deploying Ubuntu servers efficiently.
 
 **Feel free to fork, customize, and contribute!**
+
+### Development
+
+After cloning, enable the pre-commit hook so SHA256 checksums are always kept in sync:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook runs automatically on every commit. Whenever any `tubss_setup.sh` file is staged, it regenerates the corresponding `.sha256` file using `sha256sum` and re-stages it so the updated checksum is included in the same commit — no manual step required.

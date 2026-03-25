@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# TUBSS pre-commit hook — regenerates SHA256 checksums whenever tubss_setup.sh is staged.
+# Install: git config core.hooksPath .githooks
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+REGENERATED=()
+
+regenerate_checksum() {
+    local script_path="$1"       # relative to repo root, e.g. tubss_setup.sh
+    local checksum_path="$2"     # relative to repo root, e.g. tubss_setup.sha256
+
+    local abs_script="${REPO_ROOT}/${script_path}"
+    local abs_checksum="${REPO_ROOT}/${checksum_path}"
+    local dir
+    dir="$(dirname "${abs_script}")"
+
+    # Generate checksum with only the filename (no path prefix) in the output
+    (cd "${dir}" && sha256sum "$(basename "${script_path}")" > "${abs_checksum}")
+
+    git add "${abs_checksum}"
+    REGENERATED+=("${checksum_path}")
+}
+
+# Map each setup script to its corresponding checksum file
+declare -A SCRIPT_MAP=(
+    ["tubss_setup.sh"]="tubss_setup.sha256"
+    ["versions/22.04/tubss_setup.sh"]="versions/22.04/tubss_setup.sha256"
+    ["versions/24.04/tubss_setup.sh"]="versions/24.04/tubss_setup.sha256"
+)
+
+# Get list of staged files (relative to repo root)
+STAGED_FILES="$(git diff --cached --name-only)"
+
+for script in "${!SCRIPT_MAP[@]}"; do
+    if echo "${STAGED_FILES}" | grep -qx "${script}"; then
+        regenerate_checksum "${script}" "${SCRIPT_MAP[${script}]}"
+    fi
+done
+
+if [ ${#REGENERATED[@]} -gt 0 ]; then
+    echo "[tubss] Regenerated checksums for: ${REGENERATED[*]}"
+fi
