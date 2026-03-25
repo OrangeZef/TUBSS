@@ -28,10 +28,4 @@ Setting up a new server is often repetitive and time-consuming. TUBSS standardiz
 
 ### Development
 
-After cloning, enable the pre-commit hook so SHA256 checksums are always kept in sync:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-The hook runs automatically on every commit. Whenever any `tubss_setup.sh` file is staged, it regenerates the corresponding `.sha256` file using `sha256sum` and re-stages it so the updated checksum is included in the same commit — no manual step required.
+SHA256 checksums are automatically regenerated via GitHub Actions on every push to `main` that modifies a `tubss_setup.sh` file — no manual step required.
