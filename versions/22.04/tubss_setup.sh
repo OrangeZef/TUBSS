@@ -53,7 +53,6 @@ set -euo pipefail
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Define ANSI art for headers
@@ -271,7 +270,7 @@ run_preflight() {
 
     # Check 2: Ubuntu version supported — warn only (duplicate check removed from run_prereqs)
     DETECTED_VERSION=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
-    if [[ ! " ${SUPPORTED_VERSIONS[*]} " =~ " ${DETECTED_VERSION} " ]]; then
+    if [[ ! " ${SUPPORTED_VERSIONS[*]} " == *" ${DETECTED_VERSION} "* ]]; then
         echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Ubuntu ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
         echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Proceeding anyway — some features may not work correctly."
     else
@@ -309,7 +308,7 @@ run_prereqs() {
 
     # Ubuntu version already detected and checked in run_preflight
     # Display the result here for the info screen
-    if [[ ! " ${SUPPORTED_VERSIONS[*]} " =~ " ${DETECTED_VERSION} " ]]; then
+    if [[ ! " ${SUPPORTED_VERSIONS[*]} " == *" ${DETECTED_VERSION} "* ]]; then
         echo -e "${YELLOW}[WARN]${NC} Ubuntu ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
         echo -e "${YELLOW}[WARN]${NC} Proceeding anyway — some features may not work correctly."
     else
@@ -335,8 +334,10 @@ run_prereqs() {
     else
         ORIGINAL_IP=$ORIGINAL_IP_CIDR
         ORIGINAL_NETMASK_CIDR="24"
+        # shellcheck disable=SC2034 — stored for potential future use in a restore/summary display; not read elsewhere currently
         ORIGINAL_NETMASK="255.255.255.0"
     fi
+    # shellcheck disable=SC2034 — stored for potential future use in restore/display logic; interface selection uses INTERFACE_NAME instead
     ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
     ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
     if grep -q "dhcp4: true" /etc/netplan/* &>/dev/null; then
@@ -476,8 +477,16 @@ get_user_configuration() {
             echo ""
             echo "Please provide the network interface name for the static IP configuration."
             echo "Available network interfaces are:"
-            ls /sys/class/net | grep -v 'lo'
-            first_interface=$(ls /sys/class/net | grep -v 'lo' | head -n 1)
+            for _iface in /sys/class/net/*; do
+                [[ "${_iface##*/}" == "lo" ]] && continue
+                echo "${_iface##*/}"
+            done
+            first_interface=""
+            for _iface in /sys/class/net/*; do
+                [[ "${_iface##*/}" == "lo" ]] && continue
+                first_interface="${_iface##*/}"
+                break
+            done
             while true; do
                 read -p "Enter the network interface name (e.g., enp0s3) [$first_interface]: " INTERFACE_NAME
                 INTERFACE_NAME=${INTERFACE_NAME:-$first_interface}
@@ -586,6 +595,8 @@ get_user_configuration() {
 
 
     # AD details if requested
+    # shellcheck disable=SC2034 — AD_DOMAIN, AD_USER, AD_PASSWORD are reserved for future AD join implementation;
+    # they are read into globals here and unset in join_ad_domain() for credential hygiene.
     if [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo ""
         echo -e "${YELLOW}--- Active Directory Details ---${NC}"
@@ -1426,9 +1437,8 @@ run_rollback_ui() {
             ;;
         zfs)
             echo -e "${YELLOW}[INFO]${NC} Checking for intermediate ZFS snapshots..."
-            local dataset snap_short intermediate_count
+            local dataset intermediate_count
             dataset=$(echo "$chosen_name" | cut -d@ -f1)
-            snap_short=$(echo "$chosen_name" | cut -d@ -f2)
             # Count snapshots created after the chosen one on the same dataset
             intermediate_count=$(zfs list -t snapshot -H -o name "$dataset" 2>/dev/null \
                 | awk -v target="$chosen_name" 'found{count++} $0==target{found=1} END{print count+0}' || echo "0")
