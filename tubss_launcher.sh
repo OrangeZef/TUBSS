@@ -105,9 +105,9 @@ if [[ ! -s "$TEMP_CHECKSUM" ]]; then
     exit 1
 fi
 echo -e "${GREEN}[INFO]${NC} Verifying script integrity..."
-# Adjust the checksum file to match temp path
-sed -i "s|tubss_setup.sh|${TEMP_SCRIPT}|g" "$TEMP_CHECKSUM"
-if sha256sum -c "$TEMP_CHECKSUM" > /dev/null 2>&1; then
+EXPECTED_HASH=$(awk '{print $1}' "$TEMP_CHECKSUM")
+ACTUAL_HASH=$(sha256sum "$TEMP_SCRIPT" | awk '{print $1}')
+if [[ "$EXPECTED_HASH" == "$ACTUAL_HASH" ]]; then
     echo -e "${GREEN}[OK]${NC} Integrity check passed"
 else
     echo -e "${RED}[ERROR]${NC} Integrity check FAILED — aborting for security"
