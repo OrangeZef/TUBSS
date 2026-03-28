@@ -47,8 +47,44 @@ run_test() {
     passed=$((passed + 1))
 }
 
+run_debian_test() {
+    local version="$1"
+    local dockerfile="$2"
+    local image="tubss-test-debian-${version}"
+
+    echo ""
+    echo "--- Testing Debian ${version} ---"
+
+    echo "[1/4] Building test image..."
+    docker build -f "$dockerfile" -t "$image" "$REPO_DIR" --quiet
+
+    echo "[2/4] Syntax check..."
+    docker run --rm "$image" bash -n /root/tubss_setup.sh \
+        && echo "  Syntax: OK" \
+        || { echo "  Syntax: FAIL"; failed=$((failed + 1)); return; }
+
+    echo "[3/4] Shellcheck (if available)..."
+    docker run --rm "$image" bash -c \
+        "command -v shellcheck && shellcheck /root/tubss_setup.sh || echo '  shellcheck not available — skipping'"
+
+    echo "[4/4] Dry run (package install check in non-interactive mode)..."
+    docker run --rm --privileged "$image" bash -c "
+        export DEBIAN_FRONTEND=noninteractive
+        # Verify apt works and packages are resolvable
+        apt-get update -qq && apt-get install -y --dry-run \
+            curl ufw unattended-upgrades apparmor apparmor-utils net-tools htop vim build-essential rsync \
+            > /dev/null 2>&1 && echo '  Package resolution: OK'
+    " || { echo "  Package dry-run: FAIL"; failed=$((failed + 1)); return; }
+
+    echo "Debian ${version}: PASS"
+    passed=$((passed + 1))
+}
+
 run_test "24.04" "$SCRIPT_DIR/Dockerfile"
 run_test "22.04" "$SCRIPT_DIR/Dockerfile.2204"
+run_debian_test "12" "$SCRIPT_DIR/Dockerfile.debian12"
+run_debian_test "13" "$SCRIPT_DIR/Dockerfile.debian13"
+run_debian_test "14" "$SCRIPT_DIR/Dockerfile.debian14"
 
 echo ""
 echo "=========================================="

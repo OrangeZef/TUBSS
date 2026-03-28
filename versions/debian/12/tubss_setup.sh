@@ -1,12 +1,12 @@
 #!/bin/bash
 
 #==============================================================================
-# The Ubuntu Basic Setup Script (TUBSS)
-# Version: 2.4 (Pre-flight validation, custom UFW rules, post-apply
+# The Basic Setup Script (Debian)
+# Version: 2.5 (Pre-flight validation, custom UFW rules, post-apply
 #               connectivity test, rollback UI)
 # Author: OrangeZef
 #
-# This script automates the initial setup and hardening of a new Ubuntu server.
+# This script automates the initial setup and hardening of a new Debian server.
 #
 # Changelog:
 # - [v2.2] Integrated all code review recommendations.
@@ -23,7 +23,7 @@
 # - [v2.3] Fixed configure_ufw called BEFORE configure_fail2ban (banaction=ufw requires UFW active first).
 # - [v2.3] Added idempotency checks — hostname, UFW, fail2ban, auto-updates, telemetry, netplan, packages.
 # - [v2.3] Added netplan generate validation before netplan apply to prevent network lockout.
-# - [v2.3] Added Ubuntu version check at startup with supported version list.
+# - [v2.3] Added version check at startup with supported version list.
 # - [v2.3] handle_error() now explicitly calls exit 1.
 # - [v2.3] Converted packages_to_install from string to bash array.
 # - [v2.3] Extracted display_config_summary() to eliminate DRY violation between show_summary_and_confirm() and reboot_prompt().
@@ -39,6 +39,7 @@
 # - [v2.5] Added disable_cloud_init_network() to prevent cloud-init from overwriting managed netplan.
 # - [v2.5] Timestamped backup subdirectory for netplan conflict backups.
 # - [v2.5] Replaced test_static_ip_connectivity() with warn_if_gateway_unreachable() pre-write check.
+# - [Debian] Added Debian 12 support: deb.debian.org, apparmor-utils, ifupdown network config, no ubuntu-report.
 #
 # Provided by Joka.ca
 #==============================================================================
@@ -60,7 +61,7 @@ BANNER_ART="
 +---------------------------------------------+
 |    T U B S S                                |
 +---------------------------------------------+
-|    The Ubuntu Basic Setup Script            |
+|    The Basic Setup Script (Debian)          |
 |    Version 2.5                              |
 +---------------------------------------------+
 |    Provided by Joka.ca                      |
@@ -83,7 +84,7 @@ EXECUTION_ART="
 "
 CLOSING_ART="
  __________________________________________________________________
-< Thank you for using TUBSS - The Ubuntu Basic Setup Script! >
+< Thank you for using TUBSS - The Basic Setup Script (Debian)! >
  ------------------------------------------------------------------
           \
            \    .--.
@@ -129,7 +130,10 @@ PACKAGES_INSTALLED=0
 
 # --- Version detection globals (set by run_preflight, read by run_prereqs) ---
 DETECTED_VERSION=""
-SUPPORTED_VERSIONS=("20.04" "22.04" "24.04")
+SUPPORTED_VERSIONS=("12")
+
+# --- OS identification ---
+OS_ID=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
 
 # --- Network globals (safe defaults to avoid unbound variable under set -u) ---
 ORIGINAL_IP=""
@@ -268,20 +272,20 @@ run_preflight() {
         echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Root filesystem has ${avail_gb}GB free (>= 2GB required)."
     fi
 
-    # Check 2: Ubuntu version supported — warn only (duplicate check removed from run_prereqs)
+    # Check 2: Debian version supported — warn only
     DETECTED_VERSION=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
     if [[ ! " ${SUPPORTED_VERSIONS[*]} " == *" ${DETECTED_VERSION} "* ]]; then
-        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Ubuntu ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
+        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Debian ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
         echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Proceeding anyway — some features may not work correctly."
     else
-        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Ubuntu ${DETECTED_VERSION} detected — fully supported."
+        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Debian ${DETECTED_VERSION} detected — fully supported."
     fi
 
     # Check 3: Package server reachable — warn only
-    if curl --silent --max-time 5 --head http://archive.ubuntu.com > /dev/null 2>&1; then
-        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Package server archive.ubuntu.com is reachable."
+    if curl --silent --max-time 5 --head http://deb.debian.org > /dev/null 2>&1; then
+        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Package server deb.debian.org is reachable."
     else
-        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Package server archive.ubuntu.com is not reachable. Package installation may fail."
+        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Package server deb.debian.org is not reachable. Package installation may fail."
     fi
 
     # Check 4: apt state valid — warn only
@@ -306,13 +310,13 @@ run_preflight() {
 run_prereqs() {
     local disk_usage_output original_user original_user_home
 
-    # Ubuntu version already detected and checked in run_preflight
+    # Debian version already detected and checked in run_preflight
     # Display the result here for the info screen
     if [[ ! " ${SUPPORTED_VERSIONS[*]} " == *" ${DETECTED_VERSION} "* ]]; then
-        echo -e "${YELLOW}[WARN]${NC} Ubuntu ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
+        echo -e "${YELLOW}[WARN]${NC} Debian ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
         echo -e "${YELLOW}[WARN]${NC} Proceeding anyway — some features may not work correctly."
     else
-        echo -e "${GREEN}[OK]${NC} Ubuntu ${DETECTED_VERSION} detected — fully supported"
+        echo -e "${GREEN}[OK]${NC} Debian ${DETECTED_VERSION} detected — fully supported"
     fi
 
     # Get the original user's desktop path for the summary file
@@ -342,10 +346,20 @@ run_prereqs() {
     # Stored for potential future use in restore/display logic; interface selection uses INTERFACE_NAME instead
     ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
     ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
-    if grep -q "dhcp4: true" /etc/netplan/* &>/dev/null; then
-        ORIGINAL_NET_TYPE="dhcp"
-    elif grep -q "dhcp4: false" /etc/netplan/* &>/dev/null; then
-        ORIGINAL_NET_TYPE="static"
+    if ls /etc/netplan/*.yaml /etc/netplan/*.yml 2>/dev/null | grep -q .; then
+        if grep -q "dhcp4: true" /etc/netplan/* 2>/dev/null; then
+            ORIGINAL_NET_TYPE="dhcp"
+        elif grep -q "dhcp4: false" /etc/netplan/* 2>/dev/null; then
+            ORIGINAL_NET_TYPE="static"
+        else
+            ORIGINAL_NET_TYPE="unknown"
+        fi
+    elif [[ -f /etc/network/interfaces ]]; then
+        if grep -q "dhcp" /etc/network/interfaces 2>/dev/null; then
+            ORIGINAL_NET_TYPE="dhcp"
+        else
+            ORIGINAL_NET_TYPE="static-ifupdown"
+        fi
     else
         ORIGINAL_NET_TYPE="unknown"
     fi
@@ -357,7 +371,7 @@ run_prereqs() {
     ORIGINAL_AUTO_UPDATES_STATUS=$(grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades &>/dev/null && echo "Enabled" || echo "Disabled")
     ORIGINAL_FAIL2BAN_STATUS=$(dpkg -s fail2ban &>/dev/null && echo "Installed" || echo "Not Installed")
     ORIGINAL_DOMAIN_STATUS=$(realm list 2>/dev/null | grep 'realm-name:' | awk '{print $2}' || echo "Not Joined")
-    ORIGINAL_TELEMETRY_STATUS=$(dpkg -s ubuntu-report &>/dev/null && grep -q 'enable = true' /etc/ubuntu-report/ubuntu-report.conf &>/dev/null && echo "Enabled" || echo "Disabled")
+    ORIGINAL_TELEMETRY_STATUS="N/A (Debian)"
     ORIGINAL_NFS_STATUS=$(dpkg -s nfs-common &>/dev/null && echo "Installed" || echo "Not Installed")
     ORIGINAL_SMB_STATUS=$(dpkg -s cifs-utils &>/dev/null && echo "Installed" || echo "Not Installed")
     ORIGINAL_GIT_STATUS=$(dpkg -s git &>/dev/null && echo "Installed" || echo "Not Installed")
@@ -827,6 +841,28 @@ finalize_run_state() {
     sed -i "s|^RUN_END=.*|RUN_END=$(date -Iseconds)|" "$TUBSS_STATE_FILE"
 }
 
+# --- AppArmor GRUB boot parameter setup (Debian) ---
+configure_apparmor_debian() {
+    echo -ne "${YELLOW}[TUBSS] Checking AppArmor boot parameters (Debian)... ${NC}"
+    local grub_file="/etc/default/grub"
+    if [[ ! -f "$grub_file" ]]; then
+        echo -e "${YELLOW}[WARN]${NC} GRUB config not found — skipping AppArmor boot parameter setup."
+        return 0
+    fi
+    if grep -q "apparmor=1" "$grub_file" 2>/dev/null; then
+        echo -e "${GREEN}[SKIP]${NC} AppArmor boot parameters already present."
+        return 0
+    fi
+    # shellcheck disable=SC2016
+    sed -i 's/\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 apparmor=1 security=apparmor"/' "$grub_file"
+    if command -v update-grub > /dev/null 2>&1; then
+        update-grub > /dev/null 2>&1
+    else
+        echo -e "  ${YELLOW}[WARN]${NC} update-grub not found — run it manually before rebooting."
+    fi
+    echo -e "${GREEN}[OK]${NC} AppArmor kernel parameters added — takes effect on next boot."
+}
+
 # --- Step 4: Apply Configuration ---
 apply_configuration() {
     init_run_state
@@ -842,6 +878,10 @@ apply_configuration() {
     CURRENT_STEP="install_packages"
     install_packages
     update_run_state_step "install_packages"
+
+    CURRENT_STEP="configure_apparmor_debian"
+    configure_apparmor_debian
+    update_run_state_step "configure_apparmor_debian"
 
     CURRENT_STEP="configure_ufw"
     configure_ufw
@@ -925,7 +965,7 @@ install_packages() {
     wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Updating package lists failed (exit $?)"; exit 1; }
     echo -e "${GREEN}[OK]${NC} Package lists updated."
 
-    local PACKAGES=("curl" "ufw" "unattended-upgrades" "apparmor" "net-tools" "htop" "neofetch" "vim" "build-essential" "rsync")
+    local PACKAGES=("curl" "ufw" "unattended-upgrades" "apparmor" "apparmor-utils" "net-tools" "htop" "neofetch" "vim" "build-essential" "rsync")
 
     if [[ "$INSTALL_FAIL2BAN" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("fail2ban"); fi
     if [[ "$INSTALL_GIT" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("git"); fi
@@ -990,102 +1030,62 @@ EOF
 }
 
 restore_dhcp_config() {
-    local target_config_file="$1"
-    local most_recent active_iface iface_to_use
+    local ifaces_file="/etc/network/interfaces"
+    local backup_file="/etc/network/interfaces.tubss-backup"
 
-    # Try to restore a previously backed-up DHCP config
-    most_recent=$(find /etc/netplan/tubss-backup/ -maxdepth 2 \
-        \( -name "*.yaml" -o -name "*.yml" \) \
-        -printf "%T@ %p\n" 2>/dev/null \
-        | sort -rn | head -1 | awk '{print $2}')
-
-    if [[ -n "$most_recent" ]]; then
-        cp "$most_recent" /etc/netplan/
-        DHCP_RESTORE_FILE="/etc/netplan/$(basename "$most_recent")"
-        echo -e "  ${YELLOW}[NETPLAN]${NC} Restored backup config: $(basename "$most_recent")"
+    if [[ -f "$backup_file" ]]; then
+        cp "$backup_file" "$ifaces_file"
+        echo -e "  ${YELLOW}[INTERFACES]${NC} Restored backup from: ${backup_file}"
         return 0
     fi
 
-    # No backup found — check if any other netplan config exists
-    local other_config
-    other_config=$(find /etc/netplan/ -maxdepth 1 \( -name "*.yaml" -o -name "*.yml" \) \
-        ! -name "$(basename "$target_config_file")" 2>/dev/null | head -1)
-    if [[ -n "$other_config" ]]; then
-        # Other configs exist that will handle DHCP — nothing to write
-        return 0
-    fi
+    # No backup found — write minimal DHCP fallback
+    local iface="${INTERFACE_NAME:-$(ip -o -4 a | awk '{print $2}' | grep -v lo | head -1)}"
+    iface="${iface:-eth0}"
+    cat > "$ifaces_file" << EOF
+# Generated by TUBSS v${TUBSS_SCRIPT_VERSION} (DHCP fallback)
+auto lo
+iface lo inet loopback
 
-    # Last resort: write a minimal DHCP fallback
-    active_iface=$(ip -o -4 a | awk '{print $2}' | grep -v lo | head -1)
-    iface_to_use="${INTERFACE_NAME:-${active_iface:-eth0}}"
-    cat > /etc/netplan/99-tubss-dhcp.yaml << EOF
-network:
-  version: 2
-  ethernets:
-    ${iface_to_use}:
-      dhcp4: true
+auto ${iface}
+iface ${iface} inet dhcp
 EOF
-    DHCP_RESTORE_FILE="/etc/netplan/99-tubss-dhcp.yaml"
-    echo -e "  ${YELLOW}[NETPLAN]${NC} No backup found — wrote minimal DHCP config for '${iface_to_use}'."
+    echo -e "  ${YELLOW}[INTERFACES]${NC} No backup found — wrote minimal DHCP config for '${iface}'."
 }
 
 configure_network() {
-    local network_config_file
+    local ifaces_file="/etc/network/interfaces"
+    local backup_file="/etc/network/interfaces.tubss-backup"
     echo -ne "${YELLOW}[TUBSS] Configuring Network... ${NC}"
-    network_config_file="/etc/netplan/01-static-network.yaml"
+
     if [[ "$NET_TYPE" == "dhcp" ]]; then
-        if [ -f "$network_config_file" ]; then
-            DHCP_RESTORE_FILE=""
-            restore_dhcp_config "$network_config_file"
-            local static_temp="/tmp/tubss-static-rollback.yaml"
-            mv "$network_config_file" "$static_temp"
-            if ! netplan generate > /dev/null 2>&1; then
-                mv "$static_temp" "$network_config_file"
-                [[ -n "$DHCP_RESTORE_FILE" ]] && rm -f "$DHCP_RESTORE_FILE"
-                echo -e "${RED}[ERROR]${NC} Netplan configuration validation failed — rolled back to static config"
-                exit 1
-            fi
-            rm -f "$static_temp"
+        if grep -q "inet static" "$ifaces_file" 2>/dev/null; then
+            restore_dhcp_config
             echo -e "${GREEN}[OK]${NC} DHCP config restored — will apply on reboot."
         else
             echo -e "${YELLOW}[SKIPPED]${NC} Already using DHCP."
         fi
     else
-        if [[ -f "$network_config_file" ]]; then
+        if grep -q "address ${STATIC_IP:-__nonexistent__}" "$ifaces_file" 2>/dev/null; then
             echo -e "  ${GREEN}[SKIP]${NC} Static network config already exists — skipping."
-            echo -e "  ${YELLOW}[WARN]${NC} If you added netplan files since the last run, delete /etc/netplan/01-static-network.yaml and re-run to trigger cleanup."
+            echo -e "  ${YELLOW}[WARN]${NC} If you changed the IP, remove ${ifaces_file} and re-run to apply."
         else
             warn_if_gateway_unreachable
-            # Backup and remove conflicting netplan configs to prevent IP merging
-            local backup_timestamp
-            backup_timestamp=$(date +%Y%m%d-%H%M%S)
-            local backup_dir="/etc/netplan/tubss-backup/${backup_timestamp}"
-            mkdir -p "$backup_dir"
-            for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
-                [[ -f "$f" ]] || continue
-                [[ "$f" == "$network_config_file" ]] && continue
-                mv "$f" "$backup_dir/"
-                echo -e "  ${YELLOW}[NETPLAN]${NC} Backed up conflicting config: $(basename "$f")"
-            done
-            cat << EOF > "$network_config_file"
-network:
-  version: 2
-  ethernets:
-    $INTERFACE_NAME:
-      dhcp4: false
-      addresses: [$STATIC_IP/$NETMASK_CIDR]
-      routes:
-        - to: default
-          via: $GATEWAY
-      nameservers:
-        addresses: [$DNS_SERVER]
+            # Back up existing interfaces file before overwriting
+            [[ -f "$ifaces_file" ]] && cp "$ifaces_file" "$backup_file"
+            cat > "$ifaces_file" << EOF
+# Managed by TUBSS v${TUBSS_SCRIPT_VERSION} — do not edit manually
+auto lo
+iface lo inet loopback
+
+auto ${INTERFACE_NAME}
+iface ${INTERFACE_NAME} inet static
+    address ${STATIC_IP}/${NETMASK_CIDR}
+    gateway ${GATEWAY}
+    dns-nameservers ${DNS_SERVER}
 EOF
-            if ! netplan generate > /dev/null 2>&1; then
-                echo -e "${RED}[ERROR]${NC} Netplan configuration validation failed — not applying to avoid network lockout"
-                exit 1
-            fi
             disable_cloud_init_network
-            echo -e "${GREEN}[OK]${NC} Static IP config written for '$INTERFACE_NAME' — will apply on reboot."
+            echo -e "${GREEN}[OK]${NC} Static IP config written for '${INTERFACE_NAME}' — will apply on reboot."
         fi
     fi
 }
@@ -1248,17 +1248,11 @@ configure_auto_updates() {
 
 disable_telemetry() {
     if [[ "$DISABLE_TELEMETRY" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        echo -ne "${YELLOW}[TUBSS] Disabling Ubuntu Telemetry... ${NC}"
-        if grep -q "^enable = false" /etc/ubuntu-report/ubuntu-report.conf 2>/dev/null; then
-            echo -e "  ${GREEN}[SKIP]${NC} Telemetry already disabled"
-        elif [ -f /etc/ubuntu-report/ubuntu-report.conf ]; then
-            sed -i 's/^enable = true/enable = false/' /etc/ubuntu-report/ubuntu-report.conf
-            echo -e "${GREEN}[OK]${NC} Ubuntu telemetry disabled."
-        else
-            echo -e "${YELLOW}Warning: Ubuntu telemetry configuration file not found. Skipping.${NC}"
-        fi
+        echo -e "${YELLOW}[SKIPPED]${NC} Telemetry disablement is not applicable on Debian (no ubuntu-report)."
+        NEW_TELEMETRY_SUMMARY="N/A (Debian)"
     else
         echo -e "${YELLOW}[SKIPPED]${NC} Telemetry disablement."
+        NEW_TELEMETRY_SUMMARY="N/A (Debian)"
     fi
 }
 
@@ -1283,7 +1277,7 @@ reboot_prompt() {
 
     # Write summary to file
     cat << EOF > "$SUMMARY_FILE"
-TUBSS - The Ubuntu Basic Setup Script - Configuration Summary
+TUBSS - The Basic Setup Script (Debian) - Configuration Summary
 Provided by Joka.ca
 
 Date: $(date)

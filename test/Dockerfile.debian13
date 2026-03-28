@@ -1,0 +1,7 @@
+FROM debian:trixie
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl sudo systemd systemd-sysv ufw bash shellcheck \
+    && rm -rf /var/lib/apt/lists/*
+COPY versions/debian/13/tubss_setup.sh /root/tubss_setup.sh
+RUN chmod +x /root/tubss_setup.sh

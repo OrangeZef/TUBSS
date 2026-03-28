@@ -38,8 +38,15 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# Detect Ubuntu version early
+# Detect OS and version early
 VERSION_ID=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
+OS_ID=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+
+# Validate supported OS
+if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
+    echo -e "${RED}[ERROR]${NC} Unsupported OS: ${OS_ID}. TUBSS supports Ubuntu and Debian only."
+    exit 1
+fi
 
 # Display a friendly welcome message
 echo -e "${YELLOW}============================================================${NC}"
@@ -47,7 +54,7 @@ echo -e "${YELLOW}  Welcome to the TUBSS Launcher!${NC}"
 echo -e "${YELLOW}  This script will download the latest version of TUBSS.${NC}"
 echo -e "${YELLOW}============================================================${NC}"
 echo ""
-echo -e "${GREEN}[INFO]${NC} Detected Ubuntu version: ${VERSION_ID}"
+echo -e "${GREEN}[INFO]${NC} Detected OS: ${OS_ID} ${VERSION_ID}"
 echo ""
 
 # --- Ask for user confirmation before proceeding ---
@@ -63,7 +70,12 @@ echo -e "${YELLOW}Starting download...${NC}"
 
 # Build download URL — try version-specific first, fall back to main
 BASE_URL="https://raw.githubusercontent.com/OrangeZef/TUBSS/main"
-VERSION_URL="${BASE_URL}/versions/${VERSION_ID}/tubss_setup.sh"
+# Build version-specific URL based on OS
+if [[ "$OS_ID" == "debian" ]]; then
+    VERSION_URL="${BASE_URL}/versions/debian/${VERSION_ID}/tubss_setup.sh"
+else
+    VERSION_URL="${BASE_URL}/versions/${VERSION_ID}/tubss_setup.sh"
+fi
 FALLBACK_URL="${BASE_URL}/tubss_setup.sh"
 
 # Use mktemp for an unpredictable temp filename
@@ -75,10 +87,10 @@ trap 'rm -f "$TEMP_SCRIPT"' EXIT
 # Check if version-specific script exists
 if curl --silent --fail --head "$VERSION_URL" > /dev/null 2>&1; then
     DOWNLOAD_URL="$VERSION_URL"
-    echo -e "${GREEN}[INFO]${NC} Found Ubuntu ${VERSION_ID}-specific setup script"
+    echo -e "${GREEN}[INFO]${NC} Found ${OS_ID} ${VERSION_ID}-specific setup script"
 else
     DOWNLOAD_URL="$FALLBACK_URL"
-    echo -e "${YELLOW}[WARN]${NC} No Ubuntu ${VERSION_ID}-specific script found, using default"
+    echo -e "${YELLOW}[WARN]${NC} No ${OS_ID} ${VERSION_ID}-specific script found, using default"
 fi
 
 # --- Download the script securely using curl ---

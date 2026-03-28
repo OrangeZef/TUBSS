@@ -933,6 +933,19 @@ install_packages() {
     if [[ "$INSTALL_NFS" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("nfs-common"); fi
     if [[ "$INSTALL_SMB" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("cifs-utils"); fi
 
+    # Add Webmin APT repository if Webmin installation is requested
+    if [[ "$INSTALL_WEBMIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        if ! dpkg -l webmin 2>/dev/null | grep -qE '^ii'; then
+            echo -ne "${YELLOW}[TUBSS] Adding Webmin repository...${NC}"
+            curl -fsSL https://download.webmin.com/jcameron-key.asc \
+                | gpg --dearmor -o /usr/share/keyrings/webmin-archive-keyring.gpg 2>/dev/null
+            echo "deb [signed-by=/usr/share/keyrings/webmin-archive-keyring.gpg] https://download.webmin.com/download/repository sarge contrib" \
+                > /etc/apt/sources.list.d/webmin.list
+            apt-get update -y > /dev/null 2>&1
+            echo -e "${GREEN}[OK]${NC} Webmin repository added."
+        fi
+    fi
+
     for pkg in "${PACKAGES[@]}"; do
         if dpkg -l "$pkg" 2>/dev/null | grep -qE '^ii'; then
             echo -e "  ${GREEN}[SKIP]${NC} $pkg already installed"
