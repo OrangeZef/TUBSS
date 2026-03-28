@@ -132,9 +132,6 @@ PACKAGES_INSTALLED=0
 DETECTED_VERSION=""
 SUPPORTED_VERSIONS=("12")
 
-# --- OS identification ---
-OS_ID=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
-
 # --- Network globals (safe defaults to avoid unbound variable under set -u) ---
 ORIGINAL_IP=""
 
@@ -143,7 +140,6 @@ TUBSS_SCRIPT_VERSION="2.5"
 TUBSS_STATE_DIR="/var/lib/tubss"
 TUBSS_STATE_FILE="/var/lib/tubss/last_run"
 CURRENT_STEP=""
-DHCP_RESTORE_FILE=""
 
 
 # --- Utility Functions ---
@@ -346,7 +342,7 @@ run_prereqs() {
     # Stored for potential future use in restore/display logic; interface selection uses INTERFACE_NAME instead
     ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
     ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
-    if ls /etc/netplan/*.yaml /etc/netplan/*.yml 2>/dev/null | grep -q .; then
+    if compgen -G "/etc/netplan/*.yaml" > /dev/null 2>&1 || compgen -G "/etc/netplan/*.yml" > /dev/null 2>&1; then
         if grep -q "dhcp4: true" /etc/netplan/* 2>/dev/null; then
             ORIGINAL_NET_TYPE="dhcp"
         elif grep -q "dhcp4: false" /etc/netplan/* 2>/dev/null; then
