@@ -451,7 +451,9 @@ detect_os() {
             else
                 FETCH_TOOL="fastfetch"
             fi
-            [[ "$DETECTED_VERSION" == "14" ]] && DEBIAN_TESTING_TIER=1
+            if [[ "$DETECTED_VERSION" == "14" ]]; then
+                DEBIAN_TESTING_TIER=1
+            fi
             ;;
         *)
             SUPPORTED_VERSIONS=()
