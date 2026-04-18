@@ -68,30 +68,18 @@ fi
 echo ""
 echo -e "${YELLOW}Starting download...${NC}"
 
-# Build download URL — try version-specific first, fall back to main
+# Always pull the unified root script — it auto-detects OS/version via
+# /etc/os-release. (The versions/ tree is kept as a historical safety net
+# but no longer probed by the launcher.)
 BASE_URL="https://raw.githubusercontent.com/OrangeZef/TUBSS/main"
-# Build version-specific URL based on OS
-if [[ "$OS_ID" == "debian" ]]; then
-    VERSION_URL="${BASE_URL}/versions/debian/${VERSION_ID}/tubss_setup.sh"
-else
-    VERSION_URL="${BASE_URL}/versions/${VERSION_ID}/tubss_setup.sh"
-fi
-FALLBACK_URL="${BASE_URL}/tubss_setup.sh"
+DOWNLOAD_URL="${BASE_URL}/tubss_setup.sh"
+echo -e "${GREEN}[INFO]${NC} Fetching unified TUBSS setup script (auto-detects ${OS_ID} ${VERSION_ID})"
 
 # Use mktemp for an unpredictable temp filename
 TEMP_SCRIPT=$(mktemp /tmp/tubss_setup.XXXXXX.sh)
 
 # Register EXIT trap to clean up temp files
 trap 'rm -f "$TEMP_SCRIPT"' EXIT
-
-# Check if version-specific script exists
-if curl --silent --fail --head "$VERSION_URL" > /dev/null 2>&1; then
-    DOWNLOAD_URL="$VERSION_URL"
-    echo -e "${GREEN}[INFO]${NC} Found ${OS_ID} ${VERSION_ID}-specific setup script"
-else
-    DOWNLOAD_URL="$FALLBACK_URL"
-    echo -e "${YELLOW}[WARN]${NC} No ${OS_ID} ${VERSION_ID}-specific script found, using default"
-fi
 
 # --- Download the script securely using curl ---
 # The -s option makes curl silent.

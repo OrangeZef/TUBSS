@@ -1,6 +1,8 @@
-## TUBSS: The Ubuntu Basic Setup Script
+## TUBSS: The Ubuntu/Debian Basic Setup Script
 
-**TUBSS** is a comprehensive Bash script that automates the initial setup and hardening of a new Ubuntu server. With a single command, TUBSS saves time, ensures consistency, and establishes a secure, production-ready foundation.
+**TUBSS** is a comprehensive Bash script that automates the initial setup and hardening of a new Ubuntu or Debian server. With a single command, TUBSS saves time, ensures consistency, and establishes a secure, production-ready foundation.
+
+The script auto-detects OS/version via `/etc/os-release` — a single `tubss_setup.sh` at the repository root covers Ubuntu 20.04/22.04/24.04 and Debian 12/13/14. The `versions/` tree is retained as a historical safety net.
 
 ### Features
 

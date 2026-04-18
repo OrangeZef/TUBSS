@@ -24,12 +24,15 @@ jobs:
 
       - name: Regenerate SHA256 checksums
         run: |
+          # Root is the single source of truth (CC-103, v2.6+). versions/
+          # checksums are regenerated only if the file still exists — once
+          # the versions/ tree is deleted this stops touching anything.
           sha256sum tubss_setup.sh > tubss_setup.sha256
-          (cd versions/22.04 && sha256sum tubss_setup.sh > tubss_setup.sha256)
-          (cd versions/24.04 && sha256sum tubss_setup.sh > tubss_setup.sha256)
-          (cd versions/debian/12 && sha256sum tubss_setup.sh > tubss_setup.sha256)
-          (cd versions/debian/13 && sha256sum tubss_setup.sh > tubss_setup.sha256)
-          (cd versions/debian/14 && sha256sum tubss_setup.sh > tubss_setup.sha256)
+          for d in versions/22.04 versions/24.04 versions/debian/12 versions/debian/13 versions/debian/14; do
+            if [ -f "$d/tubss_setup.sh" ]; then
+              (cd "$d" && sha256sum tubss_setup.sh > tubss_setup.sha256)
+            fi
+          done
 
       - name: Check for changes
         id: diff
@@ -45,6 +48,12 @@ jobs:
         run: |
           git config user.name "OrangeZef"
           git config user.email "OrangeZef@users.noreply.github.com"
-          git add tubss_setup.sha256 versions/22.04/tubss_setup.sha256 versions/24.04/tubss_setup.sha256 versions/debian/12/tubss_setup.sha256 versions/debian/13/tubss_setup.sha256 versions/debian/14/tubss_setup.sha256
+          # Only stage checksum files that actually exist.
+          git add tubss_setup.sha256
+          for d in versions/22.04 versions/24.04 versions/debian/12 versions/debian/13 versions/debian/14; do
+            if [ -f "$d/tubss_setup.sha256" ]; then
+              git add "$d/tubss_setup.sha256"
+            fi
+          done
           git commit -m "ci: regenerate SHA256 checksums [skip ci]"
           git push

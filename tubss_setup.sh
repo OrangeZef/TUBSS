@@ -1,12 +1,12 @@
 #!/bin/bash
 
 #==============================================================================
-# The Ubuntu Basic Setup Script (TUBSS)
-# Version: 2.4 (Pre-flight validation, custom UFW rules, post-apply
-#               connectivity test, rollback UI)
+# The Ubuntu/Debian Basic Setup Script (TUBSS)
+# Version: 2.6 (CC-103: unified OS detection, netplan try, CLI flags, logging)
 # Author: OrangeZef
 #
-# This script automates the initial setup and hardening of a new Ubuntu server.
+# This script automates the initial setup and hardening of a new Ubuntu or
+# Debian server. OS and version are auto-detected via /etc/os-release.
 #
 # Changelog:
 # - [v2.2] Integrated all code review recommendations.
@@ -39,6 +39,19 @@
 # - [v2.5] Added disable_cloud_init_network() to prevent cloud-init from overwriting managed netplan.
 # - [v2.5] Timestamped backup subdirectory for netplan conflict backups.
 # - [v2.5] Replaced test_static_ip_connectivity() with warn_if_gateway_unreachable() pre-write check.
+# - [v2.6] CC-103 P0: Static-IP bug fix — netplan try (auto-revert on lockout),
+#          fallback to force-reboot flag, cloud-init disable moved before write,
+#          explicit `renderer: networkd`, gateway-in-subnet validation,
+#          netplan generate stderr captured.
+# - [v2.6] CC-103 P1: cleanup() autoremove guard moved pre-install, ORIGINAL_IP
+#          headless-safe, dpkg-query replaces dpkg -l (rc-state false positive),
+#          unconditional AD credential scrub.
+# - [v2.6] CC-103 P2: --help/--version/--unattended/--dry-run CLI flags.
+# - [v2.6] CC-103 P3: dual-stream logging to /var/log/tubss.log (or /tmp),
+#          TTY-aware spinner, TUBSS_NO_LOG escape hatch, start/end markers.
+# - [v2.6] CC-103 P5: single script covers Ubuntu + Debian via os-release
+#          branching (SUPPORTED_VERSIONS, package server, fetch tool, network
+#          renderer). versions/ tree retained as safety net.
 #
 # Provided by Joka.ca
 #==============================================================================
@@ -60,8 +73,8 @@ BANNER_ART="
 +---------------------------------------------+
 |    T U B S S                                |
 +---------------------------------------------+
-|    The Ubuntu Basic Setup Script            |
-|    Version 2.5                              |
+|    The Ubuntu/Debian Basic Setup Script     |
+|    Version 2.6                              |
 +---------------------------------------------+
 |    Provided by Joka.ca                      |
 +---------------------------------------------+
@@ -83,7 +96,7 @@ EXECUTION_ART="
 "
 CLOSING_ART="
  __________________________________________________________________
-< Thank you for using TUBSS - The Ubuntu Basic Setup Script! >
+< Thank you for using TUBSS - The Ubuntu/Debian Basic Setup Script! >
  ------------------------------------------------------------------
           \
            \    .--.
@@ -127,19 +140,37 @@ PREFLIGHT_FAILED=0
 # --- Package installation state (used by cleanup guard) ---
 PACKAGES_INSTALLED=0
 
-# --- Version detection globals (set by run_preflight, read by run_prereqs) ---
+# --- OS / version detection globals (set by detect_os, read elsewhere) ---
+DETECTED_OS=""                 # "ubuntu" or "debian"
 DETECTED_VERSION=""
-SUPPORTED_VERSIONS=("20.04" "22.04" "24.04")
+# shellcheck disable=SC2034
+# DETECTED_CODENAME is reserved for future use (per-codename tweaks)
+DETECTED_CODENAME=""
+SUPPORTED_VERSIONS=()          # Populated in detect_os based on DETECTED_OS
+PACKAGE_SERVER=""              # archive.ubuntu.com or deb.debian.org
+FETCH_TOOL=""                  # neofetch or fastfetch
+DEBIAN_TESTING_TIER=0          # 1 for Debian 14 (Forky / testing) warning
 
 # --- Network globals (safe defaults to avoid unbound variable under set -u) ---
 ORIGINAL_IP=""
 
+# --- Post-apply network state ---
+NETPLAN_APPLY_PENDING=0        # P0: forces reboot if netplan try/apply failed
+
 # --- Run-state persistence ---
-TUBSS_SCRIPT_VERSION="2.5"
+TUBSS_SCRIPT_VERSION="2.6"
 TUBSS_STATE_DIR="/var/lib/tubss"
 TUBSS_STATE_FILE="/var/lib/tubss/last_run"
 CURRENT_STEP=""
 DHCP_RESTORE_FILE=""
+
+# --- CLI / runtime flags (P2) ---
+# Declared with defaults so `set -u` does not trip before parse_args.
+TUBSS_UNATTENDED=${TUBSS_UNATTENDED:-0}
+TUBSS_DRY_RUN=${TUBSS_DRY_RUN:-0}
+TUBSS_NO_LOG=${TUBSS_NO_LOG:-0}
+TUBSS_TTY=${TUBSS_TTY:-1}
+TUBSS_ROLLBACK=0
 
 
 # --- Utility Functions ---
@@ -159,13 +190,23 @@ handle_error() {
     exit 1
 }
 
-# Function to display a simple progress spinner with task name
+# Function to display a simple progress spinner with task name.
+# When not attached to a TTY (logs, CI) we emit dots instead of backspace
+# animation so the captured log remains readable.
 spinner() {
     local pid=$1
     local task_name=$2
     local delay=0.1
     local spinstr='|/-\'
     echo -ne "${YELLOW}[TUBSS] ${task_name} ... ${NC}"
+    if [[ ${TUBSS_TTY:-1} -ne 1 ]]; then
+        while kill -0 "$pid" 2>/dev/null; do
+            printf "."
+            sleep $delay
+        done
+        printf " \n"
+        return
+    fi
     # Use kill -0 for a more robust check
     while kill -0 "$pid" 2>/dev/null; do
         local temp=${spinstr#?}
@@ -194,21 +235,85 @@ cidr2mask() {
     echo "${mask%.}"
 }
 
+# P1: dpkg -l matches rc-state (removed, config-files) as a false "installed".
+# dpkg-query --status checks the true install state only. Returns 0 when the
+# package is in `install ok installed`, non-zero otherwise.
+pkg_installed() {
+    local pkg="$1"
+    dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null \
+        | grep -q '^install ok installed$'
+}
+
+# Convert a dotted IPv4 to a 32-bit integer (stdout).
+ip_to_int() {
+    local ip="$1" a b c d
+    IFS=. read -r a b c d <<< "$ip"
+    # Validate all four octets are 0-255 numerics
+    local octet
+    for octet in "$a" "$b" "$c" "$d"; do
+        [[ "$octet" =~ ^[0-9]+$ ]] || { echo ""; return 1; }
+        (( octet >= 0 && octet <= 255 )) || { echo ""; return 1; }
+    done
+    echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+}
+
+# P0: Validate that the chosen GATEWAY lives inside STATIC_IP/NETMASK_CIDR.
+# Uses pure bash arithmetic — no ipcalc / ipset dependency. Exits non-zero
+# with a clear error if the gateway is outside the subnet.
+validate_gateway_in_subnet() {
+    local ip="$1" cidr="$2" gw="$3"
+    local ip_i gw_i mask host_bits
+    ip_i=$(ip_to_int "$ip") || {
+        echo -e "${RED}[NET-VALIDATE]${NC} Malformed IP: ${ip}" >&2
+        return 1
+    }
+    gw_i=$(ip_to_int "$gw") || {
+        echo -e "${RED}[NET-VALIDATE]${NC} Malformed gateway: ${gw}" >&2
+        return 1
+    }
+    if ! [[ "$cidr" =~ ^[0-9]+$ ]] || (( cidr < 1 || cidr > 32 )); then
+        echo -e "${RED}[NET-VALIDATE]${NC} Invalid CIDR: ${cidr}" >&2
+        return 1
+    fi
+    host_bits=$(( 32 - cidr ))
+    if (( host_bits == 32 )); then
+        mask=0
+    else
+        mask=$(( (0xFFFFFFFF << host_bits) & 0xFFFFFFFF ))
+    fi
+    if (( (ip_i & mask) != (gw_i & mask) )); then
+        echo -e "${RED}[NET-VALIDATE]${NC} Gateway ${gw} is not in subnet ${ip}/${cidr}." >&2
+        echo -e "${RED}[NET-VALIDATE]${NC} Refusing to write a static config that would break networking." >&2
+        return 1
+    fi
+    return 0
+}
+
 # Cleanup function to be executed on script exit
 cleanup() {
+    local rc=$?
     echo ""
     echo -e "${YELLOW}============================================================${NC}"
     echo -e "${YELLOW}                  Final Cleanup and Exit${NC}"
     echo -e "${YELLOW}============================================================${NC}"
     if (( PACKAGES_INSTALLED == 1 )); then
-        apt-get autoremove -y > /dev/null 2>&1 &
-        bg_pid=$!
-        spinner $bg_pid "Removing unused packages"
-        wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Removing unused packages failed (exit $?)"; exit 1; }
+        if [[ ${TUBSS_DRY_RUN:-0} -ne 1 && ${EUID:-$(id -u)} -eq 0 ]]; then
+            apt-get autoremove -y > /dev/null 2>&1 &
+            bg_pid=$!
+            spinner $bg_pid "Removing unused packages"
+            # Don't abort the rest of cleanup if autoremove itself fails during a trap
+            wait $bg_pid || echo -e "\n${YELLOW}[WARN]${NC} Removing unused packages failed (non-fatal during cleanup)"
+        else
+            echo "[DRY-RUN] Would run apt-get autoremove"
+        fi
     fi
+    # Scrub AD credentials unconditionally — they may have been partially
+    # collected before an interrupt.
+    unset -v AD_PASSWORD AD_DOMAIN AD_USER 2>/dev/null || true
     echo -e "${GREEN}[OK]${NC} Cleanup complete."
     # Revert terminal colors
     echo -e "${NC}\033[0m"
+    echo "===== TUBSS run ended rc=${rc} ====="
 }
 
 # --- Set traps for error handling and cleanup ---
@@ -219,26 +324,189 @@ trap 'cleanup' EXIT
 
 # --- Main script starts here ---
 
+# Print usage / help text. No root required.
+print_usage() {
+    cat << 'USAGE'
+TUBSS — The Ubuntu/Debian Basic Setup Script
+
+Usage:
+  sudo tubss_setup.sh [OPTIONS]
+
+Options:
+  -h, --help          Show this help and exit.
+  -V, --version       Print script version and exit.
+  -y, --unattended,
+      --defaults      Skip the default-vs-manual prompt and use defaults.
+  -n, --dry-run       Print state-changing commands instead of executing them.
+                      Best-effort; wraps apt install, ufw mutations, netplan
+                      apply/try, fail2ban restart, systemctl enable/start, and
+                      writes to /etc/ config files.
+      --rollback      Launch the snapshot-based rollback UI and exit.
+      --              Stop parsing options.
+
+Environment:
+  TUBSS_UNATTENDED=1  Equivalent to --unattended.
+  TUBSS_DRY_RUN=1     Equivalent to --dry-run.
+  TUBSS_NO_LOG=1      Skip log redirection to /var/log/tubss.log.
+
+Examples:
+  sudo tubss_setup.sh
+  sudo tubss_setup.sh --unattended
+  TUBSS_DRY_RUN=1 sudo -E tubss_setup.sh --unattended
+
+Provided by Joka.ca
+USAGE
+}
+
+print_version() {
+    echo "TUBSS ${TUBSS_SCRIPT_VERSION}"
+}
+
+# Parse CLI flags. Runs BEFORE the root check so --help / --version work for
+# non-root users.
+parse_args() {
+    while (( $# > 0 )); do
+        case "$1" in
+            -h|--help)
+                trap - EXIT ERR
+                print_usage
+                exit 0
+                ;;
+            -V|--version)
+                trap - EXIT ERR
+                print_version
+                exit 0
+                ;;
+            -y|--unattended|--defaults)
+                TUBSS_UNATTENDED=1
+                ;;
+            -n|--dry-run)
+                TUBSS_DRY_RUN=1
+                ;;
+            --rollback)
+                TUBSS_ROLLBACK=1
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                trap - EXIT ERR
+                echo "Unknown option: $1" >&2
+                echo "Run with --help for usage." >&2
+                exit 2
+                ;;
+            *)
+                trap - EXIT ERR
+                echo "Unexpected positional argument: $1" >&2
+                echo "Run with --help for usage." >&2
+                exit 2
+                ;;
+        esac
+        shift
+    done
+}
+
+# P3: route stdout+stderr through a tee to /var/log/tubss.log with timestamps.
+# Falls back to /tmp/tubss.log if the primary path isn't writable. Skipped
+# when TUBSS_NO_LOG=1 to keep dry-run / help fast and side-effect-free.
+setup_logging() {
+    [[ ${TUBSS_NO_LOG:-0} -eq 1 ]] && { TUBSS_TTY=$([[ -t 1 ]] && echo 1 || echo 0); export TUBSS_TTY; return 0; }
+    local log=/var/log/tubss.log
+    if ! ( : >> "$log" ) 2>/dev/null; then log="/tmp/tubss.log"; fi
+    TUBSS_TTY=$([[ -t 1 ]] && echo 1 || echo 0)
+    export TUBSS_TTY
+    exec > >(while IFS= read -r line; do printf '%s %s\n' "$(date -Is)" "$line"; done | tee -a "$log") 2>&1
+    echo "===== TUBSS run started $(date -Is) pid=$$ version=${TUBSS_SCRIPT_VERSION} argv=$* ====="
+}
+
+# P5: detect OS from /etc/os-release and populate distro-specific globals.
+detect_os() {
+    # shellcheck disable=SC1091
+    if [[ -r /etc/os-release ]]; then
+        . /etc/os-release
+        DETECTED_OS="${ID:-unknown}"
+        DETECTED_VERSION="${VERSION_ID:-unknown}"
+        # shellcheck disable=SC2034
+        DETECTED_CODENAME="${VERSION_CODENAME:-unknown}"
+    else
+        DETECTED_OS="unknown"
+        DETECTED_VERSION="unknown"
+        # shellcheck disable=SC2034
+        DETECTED_CODENAME="unknown"
+    fi
+
+    case "$DETECTED_OS" in
+        ubuntu)
+            SUPPORTED_VERSIONS=("20.04" "22.04" "24.04")
+            PACKAGE_SERVER="archive.ubuntu.com"
+            FETCH_TOOL="neofetch"
+            ;;
+        debian)
+            SUPPORTED_VERSIONS=("12" "13" "14")
+            PACKAGE_SERVER="deb.debian.org"
+            # Debian 12 (Bookworm) ships neofetch; 13+ uses fastfetch.
+            if [[ "$DETECTED_VERSION" == "12" ]]; then
+                FETCH_TOOL="neofetch"
+            else
+                FETCH_TOOL="fastfetch"
+            fi
+            [[ "$DETECTED_VERSION" == "14" ]] && DEBIAN_TESTING_TIER=1
+            ;;
+        *)
+            SUPPORTED_VERSIONS=()
+            PACKAGE_SERVER="archive.ubuntu.com"
+            FETCH_TOOL="neofetch"
+            ;;
+    esac
+}
+
 # Check for root privileges
 main() {
-    # Intercept --rollback before anything else
-    if [[ "${1:-}" == "--rollback" ]]; then
+    parse_args "$@"
+
+    # --rollback needs root too, but not the full setup flow.
+    if (( TUBSS_ROLLBACK == 1 )); then
+        if [[ $EUID -ne 0 ]]; then
+            echo -e "${RED}This script must be run with root privileges. Please use sudo.${NC}"
+            exit 1
+        fi
+        setup_logging "$@"
         run_rollback_ui
         exit 0
     fi
 
-    if [[ $EUID -ne 0 ]]; then
+    # Dry-run mode is safe for non-root (no state changes) — skip the root
+    # gate so CI smoke tests can run without sudo. All other paths require
+    # root.
+    if [[ $EUID -ne 0 && ${TUBSS_DRY_RUN:-0} -ne 1 ]]; then
         echo -e "${RED}This script must be run with root privileges. Please use sudo.${NC}"
         exit 1
     fi
 
+    # When running unprivileged in dry-run mode, /var/log/tubss.log is not
+    # writable — force TUBSS_NO_LOG to keep the smoke test side-effect-free.
+    if [[ $EUID -ne 0 ]]; then
+        TUBSS_NO_LOG=1
+    fi
+
+    setup_logging "$@"
+    detect_os
+
     # Change terminal colors
     echo -e "${NC}" # Reset first
-    clear
+    [[ ${TUBSS_TTY:-1} -eq 1 ]] && clear
 
     # Display banner art and system info
     echo -e "$BANNER_ART"
     echo -e "--------------------------------------------------------"
+
+    if (( TUBSS_UNATTENDED == 1 )); then
+        echo -e "${YELLOW}[INFO]${NC} Running in unattended mode (defaults)."
+    fi
+    if (( TUBSS_DRY_RUN == 1 )); then
+        echo -e "${YELLOW}[INFO]${NC} Dry-run mode enabled — best-effort (state changes logged, not executed)."
+    fi
 
     # Run the setup steps
     run_preflight
@@ -268,20 +536,33 @@ run_preflight() {
         echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Root filesystem has ${avail_gb}GB free (>= 2GB required)."
     fi
 
-    # Check 2: Ubuntu version supported — warn only (duplicate check removed from run_prereqs)
-    DETECTED_VERSION=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
-    if [[ ! " ${SUPPORTED_VERSIONS[*]} " == *" ${DETECTED_VERSION} "* ]]; then
-        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Ubuntu ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
+    # Check 2: OS version supported — warn only (duplicate check removed from run_prereqs)
+    # DETECTED_OS / DETECTED_VERSION were set in detect_os() at startup.
+    local _pretty_os
+    case "$DETECTED_OS" in
+        ubuntu) _pretty_os="Ubuntu" ;;
+        debian) _pretty_os="Debian" ;;
+        *)      _pretty_os="${DETECTED_OS:-unknown}" ;;
+    esac
+    if [[ "$DETECTED_OS" != "ubuntu" && "$DETECTED_OS" != "debian" ]]; then
+        echo -e "${RED}[PREFLIGHT] [FAIL]${NC} Unsupported OS: ${DETECTED_OS}. TUBSS supports Ubuntu and Debian only."
+        PREFLIGHT_FAILED=1
+    elif [[ ! " ${SUPPORTED_VERSIONS[*]} " == *" ${DETECTED_VERSION} "* ]]; then
+        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} ${_pretty_os} ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
         echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Proceeding anyway — some features may not work correctly."
     else
-        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Ubuntu ${DETECTED_VERSION} detected — fully supported."
+        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} ${_pretty_os} ${DETECTED_VERSION} detected — fully supported."
+    fi
+
+    if (( DEBIAN_TESTING_TIER == 1 )); then
+        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Debian 14 (Forky) is a testing-tier release — TUBSS support is best-effort."
     fi
 
     # Check 3: Package server reachable — warn only
-    if curl --silent --max-time 5 --head http://archive.ubuntu.com > /dev/null 2>&1; then
-        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Package server archive.ubuntu.com is reachable."
+    if curl --silent --max-time 5 --head "http://${PACKAGE_SERVER}" > /dev/null 2>&1; then
+        echo -e "${GREEN}[PREFLIGHT] [OK]${NC} Package server ${PACKAGE_SERVER} is reachable."
     else
-        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Package server archive.ubuntu.com is not reachable. Package installation may fail."
+        echo -e "${YELLOW}[PREFLIGHT] [WARN]${NC} Package server ${PACKAGE_SERVER} is not reachable. Package installation may fail."
     fi
 
     # Check 4: apt state valid — warn only
@@ -298,7 +579,11 @@ run_preflight() {
         exit 1
     fi
 
-    read -p "[PREFLIGHT] All checks passed. Press Enter to continue..."
+    if (( TUBSS_UNATTENDED == 1 )); then
+        echo "[PREFLIGHT] All checks passed. Continuing (unattended)."
+    else
+        read -p "[PREFLIGHT] All checks passed. Press Enter to continue..."
+    fi
     echo ""
 }
 
@@ -306,13 +591,19 @@ run_preflight() {
 run_prereqs() {
     local disk_usage_output original_user original_user_home
 
-    # Ubuntu version already detected and checked in run_preflight
+    # OS version already detected and checked in run_preflight
     # Display the result here for the info screen
+    local _pretty_os
+    case "$DETECTED_OS" in
+        ubuntu) _pretty_os="Ubuntu" ;;
+        debian) _pretty_os="Debian" ;;
+        *)      _pretty_os="${DETECTED_OS:-unknown}" ;;
+    esac
     if [[ ! " ${SUPPORTED_VERSIONS[*]} " == *" ${DETECTED_VERSION} "* ]]; then
-        echo -e "${YELLOW}[WARN]${NC} Ubuntu ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
+        echo -e "${YELLOW}[WARN]${NC} ${_pretty_os} ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
         echo -e "${YELLOW}[WARN]${NC} Proceeding anyway — some features may not work correctly."
     else
-        echo -e "${GREEN}[OK]${NC} Ubuntu ${DETECTED_VERSION} detected — fully supported"
+        echo -e "${GREEN}[OK]${NC} ${_pretty_os} ${DETECTED_VERSION} detected — fully supported"
     fi
 
     # Get the original user's desktop path for the summary file
@@ -326,41 +617,68 @@ run_prereqs() {
     SUMMARY_FILE="$DESKTOP_DIR/tubss_configuration_summary_$(date +%Y%m%d_%H%M%S).txt"
 
     # Capture Before Values
-    ORIGINAL_IP_CIDR=$(ip -o -4 a | awk '{print $4}' | grep -v 'lo' | head -n 1)
-    if [[ "$ORIGINAL_IP_CIDR" =~ "/" ]]; then
+    # P1: headless/no-IP hosts produce empty pipes — guard with `|| true` and
+    # fall back to "0.0.0.0" so set -u downstream stays safe.
+    ORIGINAL_IP_CIDR=$(ip -o -4 a 2>/dev/null | awk '{print $4}' | grep -v 'lo' | head -n 1 || true)
+    ORIGINAL_NETMASK_DETECTED=1
+    if [[ -z "${ORIGINAL_IP_CIDR:-}" ]]; then
+        ORIGINAL_IP="0.0.0.0"
+        ORIGINAL_NETMASK_CIDR="24"
+        ORIGINAL_NETMASK_DETECTED=0
+        # shellcheck disable=SC2034
+        ORIGINAL_NETMASK="255.255.255.0"
+    elif [[ "$ORIGINAL_IP_CIDR" =~ "/" ]]; then
         ORIGINAL_IP=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f1)
         ORIGINAL_NETMASK_CIDR=$(echo "$ORIGINAL_IP_CIDR" | cut -d/ -f2)
         ORIGINAL_NETMASK=$(cidr2mask "$ORIGINAL_NETMASK_CIDR")
     else
-        ORIGINAL_IP=$ORIGINAL_IP_CIDR
+        ORIGINAL_IP="$ORIGINAL_IP_CIDR"
         ORIGINAL_NETMASK_CIDR="24"
+        ORIGINAL_NETMASK_DETECTED=0
         # shellcheck disable=SC2034
         # Stored for potential future use in a restore/summary display; not read elsewhere currently
         ORIGINAL_NETMASK="255.255.255.0"
     fi
     # shellcheck disable=SC2034
     # Stored for potential future use in restore/display logic; interface selection uses INTERFACE_NAME instead
-    ORIGINAL_INTERFACE=$(ip -o -4 a | awk '{print $2}' | grep -v 'lo' | head -n 1)
-    ORIGINAL_GATEWAY=$(ip r | grep default | awk '{print $3}' | head -n 1)
-    if grep -q "dhcp4: true" /etc/netplan/* &>/dev/null; then
-        ORIGINAL_NET_TYPE="dhcp"
-    elif grep -q "dhcp4: false" /etc/netplan/* &>/dev/null; then
-        ORIGINAL_NET_TYPE="static"
+    ORIGINAL_INTERFACE=$(ip -o -4 a 2>/dev/null | awk '{print $2}' | grep -v 'lo' | head -n 1 || true)
+    ORIGINAL_GATEWAY=$(ip r 2>/dev/null | grep default | awk '{print $3}' | head -n 1 || true)
+    # Detect network management layer. On Ubuntu, netplan rules. On Debian,
+    # /etc/network/interfaces may be the canonical config — prefer netplan
+    # if present, otherwise look at ifupdown.
+    if compgen -G "/etc/netplan/*.yaml" > /dev/null 2>&1 || compgen -G "/etc/netplan/*.yml" > /dev/null 2>&1; then
+        if grep -q "dhcp4: true" /etc/netplan/* 2>/dev/null; then
+            ORIGINAL_NET_TYPE="dhcp"
+        elif grep -q "dhcp4: false" /etc/netplan/* 2>/dev/null; then
+            ORIGINAL_NET_TYPE="static"
+        else
+            ORIGINAL_NET_TYPE="unknown"
+        fi
+    elif [[ -f /etc/network/interfaces ]]; then
+        if grep -q "dhcp" /etc/network/interfaces 2>/dev/null; then
+            ORIGINAL_NET_TYPE="dhcp"
+        else
+            ORIGINAL_NET_TYPE="static-ifupdown"
+        fi
     else
         ORIGINAL_NET_TYPE="unknown"
     fi
 
     ORIGINAL_HOSTNAME=$(hostname)
-    ORIGINAL_DNS=$(resolvectl status | grep 'DNS Servers' | awk '{print $3}' | head -n 1 || echo "N/A")
-    ORIGINAL_WEBMIN_STATUS=$(dpkg -s webmin &>/dev/null && echo "Installed" || echo "Not Installed")
-    ORIGINAL_UFW_STATUS=$(ufw status | grep 'Status:' | awk '{print $2}')
+    ORIGINAL_DNS=$(resolvectl status 2>/dev/null | grep 'DNS Servers' | awk '{print $3}' | head -n 1 || echo "N/A")
+    ORIGINAL_WEBMIN_STATUS=$(pkg_installed webmin && echo "Installed" || echo "Not Installed")
+    ORIGINAL_UFW_STATUS=$(ufw status 2>/dev/null | grep 'Status:' | awk '{print $2}' || echo "inactive")
     ORIGINAL_AUTO_UPDATES_STATUS=$(grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades &>/dev/null && echo "Enabled" || echo "Disabled")
-    ORIGINAL_FAIL2BAN_STATUS=$(dpkg -s fail2ban &>/dev/null && echo "Installed" || echo "Not Installed")
+    ORIGINAL_FAIL2BAN_STATUS=$(pkg_installed fail2ban && echo "Installed" || echo "Not Installed")
     ORIGINAL_DOMAIN_STATUS=$(realm list 2>/dev/null | grep 'realm-name:' | awk '{print $2}' || echo "Not Joined")
-    ORIGINAL_TELEMETRY_STATUS=$(dpkg -s ubuntu-report &>/dev/null && grep -q 'enable = true' /etc/ubuntu-report/ubuntu-report.conf &>/dev/null && echo "Enabled" || echo "Disabled")
-    ORIGINAL_NFS_STATUS=$(dpkg -s nfs-common &>/dev/null && echo "Installed" || echo "Not Installed")
-    ORIGINAL_SMB_STATUS=$(dpkg -s cifs-utils &>/dev/null && echo "Installed" || echo "Not Installed")
-    ORIGINAL_GIT_STATUS=$(dpkg -s git &>/dev/null && echo "Installed" || echo "Not Installed")
+    if [[ "$DETECTED_OS" == "debian" ]]; then
+        ORIGINAL_TELEMETRY_STATUS="N/A (Debian)"
+    else
+        ORIGINAL_TELEMETRY_STATUS=$(pkg_installed ubuntu-report && grep -q 'enable = true' /etc/ubuntu-report/ubuntu-report.conf &>/dev/null && echo "Enabled" || echo "Disabled")
+    fi
+    ORIGINAL_NFS_STATUS=$(pkg_installed nfs-common && echo "Installed" || echo "Not Installed")
+    ORIGINAL_SMB_STATUS=$(pkg_installed cifs-utils && echo "Installed" || echo "Not Installed")
+    ORIGINAL_GIT_STATUS=$(pkg_installed git && echo "Installed" || echo "Not Installed")
 
     # System Information Screen
     echo ""
@@ -382,7 +700,11 @@ run_prereqs() {
     fi
 
     echo -e "--------------------------------------------------------"
-    read -p "Press Enter to begin the configuration..."
+    if (( TUBSS_UNATTENDED == 1 )); then
+        echo "[UNATTENDED] Beginning configuration."
+    else
+        read -p "Press Enter to begin the configuration..."
+    fi
 }
 
 # --- Step 2: Get User Configuration ---
@@ -390,9 +712,14 @@ get_user_configuration() {
     local first_interface
     # Initial Prompt for Defaults
     echo ""
-    read -p "Would you like to use the default configuration or manually configure each option? (default/manual) [default]: " CONFIG_CHOICE
-    CONFIG_CHOICE=${CONFIG_CHOICE:-default}
-    CONFIG_CHOICE=$(echo "$CONFIG_CHOICE" | tr '[:upper:]' '[:lower:]')
+    if (( TUBSS_UNATTENDED == 1 )); then
+        CONFIG_CHOICE="default"
+        echo "[UNATTENDED] Using default configuration (skipping default-vs-manual prompt)."
+    else
+        read -p "Would you like to use the default configuration or manually configure each option? (default/manual) [default]: " CONFIG_CHOICE
+        CONFIG_CHOICE=${CONFIG_CHOICE:-default}
+        CONFIG_CHOICE=$(echo "$CONFIG_CHOICE" | tr '[:upper:]' '[:lower:]')
+    fi
 
     # User Configuration Prompts
     echo -e "${YELLOW}--------------------------------------------------------${NC}"
@@ -508,7 +835,11 @@ get_user_configuration() {
                 fi
             done
             while true; do
-                read -p "Enter the network mask (CIDR notation, e.g., 24) [${ORIGINAL_NETMASK_CIDR}]: " NETMASK_CIDR
+                local _netmask_label="${ORIGINAL_NETMASK_CIDR}"
+                if (( ${ORIGINAL_NETMASK_DETECTED:-1} == 0 )); then
+                    _netmask_label="${ORIGINAL_NETMASK_CIDR} (default)"
+                fi
+                read -p "Enter the network mask (CIDR notation, e.g., 24) [${_netmask_label}]: " NETMASK_CIDR
                 NETMASK_CIDR=${NETMASK_CIDR:-$ORIGINAL_NETMASK_CIDR}
                 if [[ "$NETMASK_CIDR" =~ ^(8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32)$ ]]; then
                     break
@@ -741,8 +1072,13 @@ show_summary_and_confirm() {
     echo -e "$SUMMARY_ART"
     display_config_summary
 
-    read -p "Does the above configuration look correct? (yes/no) [yes]: " CONFIRM_EXECUTION
-    CONFIRM_EXECUTION=${CONFIRM_EXECUTION:-yes}
+    if (( TUBSS_UNATTENDED == 1 )); then
+        CONFIRM_EXECUTION="yes"
+        echo "[UNATTENDED] Auto-confirming configuration."
+    else
+        read -p "Does the above configuration look correct? (yes/no) [yes]: " CONFIRM_EXECUTION
+        CONFIRM_EXECUTION=${CONFIRM_EXECUTION:-yes}
+    fi
 
     if [[ ! "$CONFIRM_EXECUTION" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -e "${RED}Execution aborted by user.${NC}"
@@ -797,6 +1133,10 @@ display_prior_run_state() {
 }
 
 init_run_state() {
+    if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo "[DRY-RUN] write run state to $TUBSS_STATE_FILE"
+        return 0
+    fi
     mkdir -p "$TUBSS_STATE_DIR"
     cat > "$TUBSS_STATE_FILE" << EOF
 TUBSS_VERSION=${TUBSS_SCRIPT_VERSION}
@@ -863,11 +1203,45 @@ apply_configuration() {
     join_ad_domain
     update_run_state_step "join_ad_domain"
 
+    # Debian requires an extra AppArmor GRUB nudge (Ubuntu has it on by default)
+    if [[ "$DETECTED_OS" == "debian" ]]; then
+        CURRENT_STEP="configure_apparmor_debian"
+        configure_apparmor_debian
+        update_run_state_step "configure_apparmor_debian"
+    fi
+
     # Network Configuration — done last so all other steps complete before
     # the network changes on reboot
     CURRENT_STEP="configure_network"
     configure_network
     update_run_state_step "configure_network"
+}
+
+# --- Debian-only: AppArmor GRUB boot parameter setup ---
+configure_apparmor_debian() {
+    echo -ne "${YELLOW}[TUBSS] Checking AppArmor boot parameters (Debian)... ${NC}"
+    local grub_file="/etc/default/grub"
+    if [[ ! -f "$grub_file" ]]; then
+        echo -e "${YELLOW}[WARN]${NC} GRUB config not found — skipping AppArmor boot parameter setup."
+        return 0
+    fi
+    if grep -q "apparmor=1" "$grub_file" 2>/dev/null; then
+        echo -e "${GREEN}[SKIP]${NC} AppArmor boot parameters already present."
+        return 0
+    fi
+    if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo ""
+        echo "[DRY-RUN] patch ${grub_file} with apparmor=1 security=apparmor and run update-grub"
+        return 0
+    fi
+    # shellcheck disable=SC2016
+    sed -i 's/\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 apparmor=1 security=apparmor"/' "$grub_file"
+    if command -v update-grub > /dev/null 2>&1; then
+        update-grub > /dev/null 2>&1
+    else
+        echo -e "  ${YELLOW}[WARN]${NC} update-grub not found — run it manually before rebooting."
+    fi
+    echo -e "${GREEN}[OK]${NC} AppArmor kernel parameters added — takes effect on next boot."
 }
 
 configure_snapshot() {
@@ -910,6 +1284,8 @@ configure_hostname() {
     local NEW_HOSTNAME="$HOSTNAME"
     if [[ "$(hostname)" == "$NEW_HOSTNAME" ]]; then
         echo -e "  ${GREEN}[SKIP]${NC} Hostname already set to $NEW_HOSTNAME"
+    elif [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo "[DRY-RUN] hostnamectl set-hostname $NEW_HOSTNAME"
     else
         hostnamectl set-hostname "$NEW_HOSTNAME"
         echo -e "${GREEN}[OK]${NC} Hostname set to '$NEW_HOSTNAME'."
@@ -919,13 +1295,24 @@ configure_hostname() {
 install_packages() {
     local packages_to_install=()
     echo -ne "${YELLOW}[TUBSS] Updating package lists...${NC}"
-    apt-get update -y > /dev/null 2>&1 &
-    bg_pid=$!
-    spinner $bg_pid "Updating package lists"
-    wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Updating package lists failed (exit $?)"; exit 1; }
+    if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo ""
+        echo "[DRY-RUN] apt-get update -y"
+    else
+        apt-get update -y > /dev/null 2>&1 &
+        bg_pid=$!
+        spinner $bg_pid "Updating package lists"
+        wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Updating package lists failed (exit $?)"; exit 1; }
+    fi
     echo -e "${GREEN}[OK]${NC} Package lists updated."
 
-    local PACKAGES=("curl" "ufw" "unattended-upgrades" "apparmor" "net-tools" "htop" "neofetch" "vim" "build-essential" "rsync")
+    # Distro-aware base package set (P5).
+    # - Ubuntu + Debian 12 use neofetch; Debian 13/14 use fastfetch.
+    # - Debian ships apparmor-utils separately; Ubuntu pulls it via apparmor.
+    local PACKAGES=("curl" "ufw" "unattended-upgrades" "apparmor" "net-tools" "htop" "${FETCH_TOOL}" "vim" "build-essential" "rsync")
+    if [[ "$DETECTED_OS" == "debian" ]]; then
+        PACKAGES+=("apparmor-utils")
+    fi
 
     if [[ "$INSTALL_FAIL2BAN" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("fail2ban"); fi
     if [[ "$INSTALL_GIT" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("git"); fi
@@ -935,36 +1322,48 @@ install_packages() {
 
     # Add Webmin APT repository if Webmin installation is requested
     if [[ "$INSTALL_WEBMIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        if ! dpkg -l webmin 2>/dev/null | grep -qE '^ii'; then
+        if ! pkg_installed webmin; then
             echo -ne "${YELLOW}[TUBSS] Adding Webmin repository...${NC}"
-            curl -fsSL https://download.webmin.com/jcameron-key.asc \
-                | gpg --dearmor -o /usr/share/keyrings/webmin-archive-keyring.gpg 2>/dev/null
-            echo "deb [signed-by=/usr/share/keyrings/webmin-archive-keyring.gpg] https://download.webmin.com/download/repository sarge contrib" \
-                > /etc/apt/sources.list.d/webmin.list
-            apt-get update -y > /dev/null 2>&1
+            if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+                echo ""
+                echo "[DRY-RUN] add Webmin APT repo + key + apt-get update"
+            else
+                curl -fsSL https://download.webmin.com/jcameron-key.asc \
+                    | gpg --dearmor -o /usr/share/keyrings/webmin-archive-keyring.gpg 2>/dev/null
+                echo "deb [signed-by=/usr/share/keyrings/webmin-archive-keyring.gpg] https://download.webmin.com/download/repository sarge contrib" \
+                    > /etc/apt/sources.list.d/webmin.list
+                apt-get update -y > /dev/null 2>&1
+            fi
             echo -e "${GREEN}[OK]${NC} Webmin repository added."
         fi
     fi
 
     for pkg in "${PACKAGES[@]}"; do
-        if dpkg -l "$pkg" 2>/dev/null | grep -qE '^ii'; then
+        if pkg_installed "$pkg"; then
             echo -e "  ${GREEN}[SKIP]${NC} $pkg already installed"
         else
             packages_to_install+=("$pkg")
         fi
     done
 
+    # P1: Flip the autoremove guard BEFORE we mutate the package database so
+    # that an interrupted install still triggers cleanup on exit.
     if [[ ${#packages_to_install[@]} -gt 0 ]]; then
+        PACKAGES_INSTALLED=1
         echo -ne "${YELLOW}[TUBSS] Installing packages...${NC}"
-        NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages_to_install[@]}" > /dev/null 2>&1 &
-        bg_pid=$!
-        spinner $bg_pid "Installing packages"
-        wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Installing packages failed (exit $?)"; exit 1; }
+        if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+            echo ""
+            echo "[DRY-RUN] apt-get install -y ${packages_to_install[*]}"
+        else
+            NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages_to_install[@]}" > /dev/null 2>&1 &
+            bg_pid=$!
+            spinner $bg_pid "Installing packages"
+            wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Installing packages failed (exit $?)"; exit 1; }
+        fi
         echo -e "${GREEN}[OK]${NC} All selected packages installed successfully."
     else
         echo -e "  ${GREEN}[SKIP]${NC} All packages already installed"
     fi
-    PACKAGES_INSTALLED=1
 }
 
 disable_cloud_init_network() {
@@ -993,11 +1392,18 @@ restore_dhcp_config() {
     local target_config_file="$1"
     local most_recent active_iface iface_to_use
 
-    # Try to restore a previously backed-up DHCP config
-    most_recent=$(find /etc/netplan/tubss-backup/ -maxdepth 2 \
+    if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo "[DRY-RUN] restore DHCP config (netplan) — target=${target_config_file}"
+        return 0
+    fi
+
+    # Try to restore a previously backed-up DHCP config.
+    # `find` may exit non-zero under pipefail when the backup dir doesn't
+    # exist — `|| true` keeps us out of the ERR trap in that case.
+    most_recent=$( (find /etc/netplan/tubss-backup/ -maxdepth 2 \
         \( -name "*.yaml" -o -name "*.yml" \) \
         -printf "%T@ %p\n" 2>/dev/null \
-        | sort -rn | head -1 | awk '{print $2}')
+        | sort -rn | head -1 | awk '{print $2}') || true)
 
     if [[ -n "$most_recent" ]]; then
         cp "$most_recent" /etc/netplan/
@@ -1029,24 +1435,114 @@ EOF
     echo -e "  ${YELLOW}[NETPLAN]${NC} No backup found — wrote minimal DHCP config for '${iface_to_use}'."
 }
 
+# Decide whether this host should use netplan or ifupdown. Debian may have
+# both; netplan wins when present.
+_network_renderer() {
+    if command -v netplan > /dev/null 2>&1 \
+        && ( compgen -G "/etc/netplan/*.yaml" > /dev/null 2>&1 \
+          || compgen -G "/etc/netplan/*.yml" > /dev/null 2>&1 \
+          || [[ "$DETECTED_OS" == "ubuntu" ]] ); then
+        echo "netplan"
+    elif [[ -f /etc/network/interfaces ]]; then
+        echo "ifupdown"
+    elif command -v netplan > /dev/null 2>&1; then
+        echo "netplan"
+    else
+        echo "unknown"
+    fi
+}
+
+# P0: Apply the freshly-generated netplan config. Prefer `netplan try` because
+# it auto-reverts after ~120s if SSH dies, preventing remote lockout. Fall
+# back to `netplan apply` when `try` is unavailable or fails in unattended
+# mode; on failure, set NETPLAN_APPLY_PENDING so the reboot prompt is forced.
+_netplan_apply_or_try() {
+    local gen_err
+    gen_err=$(mktemp)
+    if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo "[DRY-RUN] netplan generate"
+    elif ! netplan generate 2>"$gen_err"; then
+        echo -e "${RED}[ERROR]${NC} Netplan configuration validation failed — not applying to avoid network lockout"
+        echo -e "${RED}[ERROR]${NC} netplan generate stderr:"
+        sed 's/^/    /' "$gen_err" >&2 || true
+        rm -f "$gen_err"
+        exit 1
+    fi
+    rm -f "$gen_err"
+
+    if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo "[DRY-RUN] netplan try --timeout 60  (fallback: netplan apply)"
+        echo -e "  ${YELLOW}[NETPLAN]${NC} Dry-run — skipping live apply."
+        return 0
+    fi
+
+    # Detect whether `netplan try` is supported on this distro version.
+    # Merge stderr into stdout: some netplan builds print --help to stderr, and
+    # the flag may appear as `--timeout=SECS` — match on the literal `--timeout`.
+    local try_timeout=60
+    if (( TUBSS_UNATTENDED == 1 )); then
+        try_timeout=30
+    fi
+    if netplan try --help 2>&1 | grep -q -- '--timeout'; then
+        echo -e "  ${YELLOW}[NETPLAN]${NC} Running 'netplan try --timeout ${try_timeout}' (auto-reverts if SSH dies)..."
+        if netplan try --timeout "$try_timeout" < /dev/null; then
+            echo -e "  ${GREEN}[NETPLAN]${NC} 'netplan try' accepted — config applied live."
+            return 0
+        else
+            echo -e "  ${YELLOW}[NETPLAN]${NC} 'netplan try' failed or was reverted — falling back."
+        fi
+    else
+        echo -e "  ${YELLOW}[NETPLAN]${NC} 'netplan try' unavailable — falling back to 'netplan apply'."
+    fi
+
+    # Fallback: netplan apply. If it fails (e.g. noninteractive shell, SSH
+    # disruption risk) mark the reboot as mandatory so user can't skip it.
+    if netplan apply > /dev/null 2>&1; then
+        echo -e "  ${GREEN}[NETPLAN]${NC} 'netplan apply' succeeded."
+        return 0
+    fi
+
+    NETPLAN_APPLY_PENDING=1
+    echo -e "  ${YELLOW}[NETPLAN]${NC} 'netplan apply' deferred — a reboot is required to activate the new config."
+    return 0
+}
+
 configure_network() {
-    local network_config_file
-    echo -ne "${YELLOW}[TUBSS] Configuring Network... ${NC}"
-    network_config_file="/etc/netplan/01-static-network.yaml"
+    local renderer
+    renderer=$(_network_renderer)
+    echo -ne "${YELLOW}[TUBSS] Configuring Network (renderer=${renderer})... ${NC}"
+
+    if [[ "$renderer" == "ifupdown" ]]; then
+        _configure_network_ifupdown
+        return
+    fi
+
+    # --- netplan path ---
+    local network_config_file="/etc/netplan/01-static-network.yaml"
     if [[ "$NET_TYPE" == "dhcp" ]]; then
         if [ -f "$network_config_file" ]; then
             DHCP_RESTORE_FILE=""
             restore_dhcp_config "$network_config_file"
-            local static_temp="/tmp/tubss-static-rollback.yaml"
-            mv "$network_config_file" "$static_temp"
-            if ! netplan generate > /dev/null 2>&1; then
-                mv "$static_temp" "$network_config_file"
-                [[ -n "$DHCP_RESTORE_FILE" ]] && rm -f "$DHCP_RESTORE_FILE"
-                echo -e "${RED}[ERROR]${NC} Netplan configuration validation failed — rolled back to static config"
-                exit 1
+            if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+                echo "[DRY-RUN] mv $network_config_file /tmp/tubss-static-rollback.yaml; netplan generate; netplan apply"
+                echo -e "${GREEN}[OK]${NC} DHCP config restored — will apply on reboot. (dry-run)"
+            else
+                local static_temp="/tmp/tubss-static-rollback.yaml"
+                mv "$network_config_file" "$static_temp"
+                local gen_err
+                gen_err=$(mktemp)
+                if ! netplan generate 2>"$gen_err"; then
+                    mv "$static_temp" "$network_config_file"
+                    [[ -n "$DHCP_RESTORE_FILE" ]] && rm -f "$DHCP_RESTORE_FILE"
+                    echo -e "${RED}[ERROR]${NC} Netplan configuration validation failed — rolled back to static config"
+                    echo -e "${RED}[ERROR]${NC} netplan generate stderr:"
+                    sed 's/^/    /' "$gen_err" >&2 || true
+                    rm -f "$gen_err"
+                    exit 1
+                fi
+                rm -f "$static_temp" "$gen_err"
+                echo -e "${GREEN}[OK]${NC} DHCP config restored — will apply on reboot."
             fi
-            rm -f "$static_temp"
-            echo -e "${GREEN}[OK]${NC} DHCP config restored — will apply on reboot."
         else
             echo -e "${YELLOW}[SKIPPED]${NC} Already using DHCP."
         fi
@@ -1056,6 +1552,15 @@ configure_network() {
             echo -e "  ${YELLOW}[WARN]${NC} If you added netplan files since the last run, delete /etc/netplan/01-static-network.yaml and re-run to trigger cleanup."
         else
             warn_if_gateway_unreachable
+            # P0: Validate gateway is inside the chosen subnet BEFORE writing
+            # anything. Refuse with a clear error otherwise.
+            if ! validate_gateway_in_subnet "$STATIC_IP" "$NETMASK_CIDR" "$GATEWAY"; then
+                exit 1
+            fi
+            # P0: Disable cloud-init network management FIRST so it cannot
+            # race with our write or overwrite on next boot.
+            disable_cloud_init_network
+
             # Backup and remove conflicting netplan configs to prevent IP merging
             local backup_timestamp
             backup_timestamp=$(date +%Y%m%d-%H%M%S)
@@ -1067,9 +1572,13 @@ configure_network() {
                 mv "$f" "$backup_dir/"
                 echo -e "  ${YELLOW}[NETPLAN]${NC} Backed up conflicting config: $(basename "$f")"
             done
-            cat << EOF > "$network_config_file"
+            if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+                echo "[DRY-RUN] write netplan static config to $network_config_file"
+            else
+                cat << EOF > "$network_config_file"
 network:
   version: 2
+  renderer: networkd
   ethernets:
     $INTERFACE_NAME:
       dhcp4: false
@@ -1080,14 +1589,67 @@ network:
       nameservers:
         addresses: [$DNS_SERVER]
 EOF
-            if ! netplan generate > /dev/null 2>&1; then
-                echo -e "${RED}[ERROR]${NC} Netplan configuration validation failed — not applying to avoid network lockout"
-                exit 1
+                # Keep the static config root-only to match the rest of /etc/netplan.
+                chmod 600 "$network_config_file" 2>/dev/null || true
             fi
-            disable_cloud_init_network
-            echo -e "${GREEN}[OK]${NC} Static IP config written for '$INTERFACE_NAME' — will apply on reboot."
+            # P0: attempt to apply immediately via `netplan try` (auto-reverts
+            # on SSH loss). Falls back to `netplan apply` or sets the
+            # deferred-reboot flag.
+            _netplan_apply_or_try
+            if (( NETPLAN_APPLY_PENDING == 1 )); then
+                echo -e "${YELLOW}[OK]${NC} Static IP config written for '$INTERFACE_NAME' — reboot required to activate."
+            else
+                echo -e "${GREEN}[OK]${NC} Static IP config applied for '$INTERFACE_NAME'."
+            fi
         fi
     fi
+}
+
+# Debian ifupdown (/etc/network/interfaces) path — used when netplan is absent.
+_configure_network_ifupdown() {
+    local ifaces_file="/etc/network/interfaces"
+    local backup_file="/etc/network/interfaces.tubss-backup"
+
+    if [[ "$NET_TYPE" == "dhcp" ]]; then
+        if grep -q "inet static" "$ifaces_file" 2>/dev/null; then
+            restore_dhcp_config "$ifaces_file"
+            echo -e "${GREEN}[OK]${NC} DHCP config restored — will apply on reboot."
+        else
+            echo -e "${YELLOW}[SKIPPED]${NC} Already using DHCP."
+        fi
+        return
+    fi
+
+    if grep -q "address ${STATIC_IP:-__nonexistent__}" "$ifaces_file" 2>/dev/null; then
+        echo -e "  ${GREEN}[SKIP]${NC} Static network config already exists — skipping."
+        echo -e "  ${YELLOW}[WARN]${NC} If you changed the IP, remove ${ifaces_file} and re-run to apply."
+        return
+    fi
+
+    warn_if_gateway_unreachable
+    if ! validate_gateway_in_subnet "$STATIC_IP" "$NETMASK_CIDR" "$GATEWAY"; then
+        exit 1
+    fi
+    disable_cloud_init_network
+    if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo "[DRY-RUN] backup + write ${ifaces_file} with static config"
+    else
+        [[ -f "$ifaces_file" ]] && cp "$ifaces_file" "$backup_file"
+        cat > "$ifaces_file" << EOF
+# Managed by TUBSS v${TUBSS_SCRIPT_VERSION} — do not edit manually
+auto lo
+iface lo inet loopback
+
+auto ${INTERFACE_NAME}
+iface ${INTERFACE_NAME} inet static
+    address ${STATIC_IP}/${NETMASK_CIDR}
+    gateway ${GATEWAY}
+    dns-nameservers ${DNS_SERVER}
+EOF
+    fi
+    # ifupdown doesn't have a no-risk "try" mode — defer to reboot.
+    NETPLAN_APPLY_PENDING=1
+    echo -e "${YELLOW}[OK]${NC} Static IP config written for '${INTERFACE_NAME}' — reboot required to activate."
 }
 
 # --- Feature 3: Pre-write Gateway Reachability Check ---
@@ -1112,6 +1674,11 @@ configure_ufw() {
         echo -ne "${YELLOW}[TUBSS] Configuring UFW... ${NC}"
         if ufw status 2>/dev/null | grep -q "Status: active"; then
             echo -e "  ${GREEN}[SKIP]${NC} UFW already active"
+        elif [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+            echo ""
+            echo "[DRY-RUN] ufw default deny incoming / allow outgoing"
+            echo "[DRY-RUN] ufw allow ssh"
+            echo "[DRY-RUN] ufw --force enable"
         else
             ufw default deny incoming
             ufw default allow outgoing
@@ -1195,6 +1762,9 @@ configure_fail2ban() {
 
         if [[ -f "$jail_file" ]]; then
             echo -e "  ${GREEN}[SKIP]${NC} Fail2ban already configured — skipping (delete /etc/fail2ban/jail.local to reconfigure)"
+        elif [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+            echo ""
+            echo "[DRY-RUN] write ${jail_file}, systemctl daemon-reload, systemctl enable --now fail2ban"
         else
             # Write the jail.local file
             cat << EOF > "$jail_file"
@@ -1236,6 +1806,9 @@ configure_auto_updates() {
         echo -ne "${YELLOW}[TUBSS] Enabling Automatic Security Updates... ${NC}"
         if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]]; then
             echo -e "  ${GREEN}[SKIP]${NC} Auto-updates already configured"
+        elif [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+            echo ""
+            echo "[DRY-RUN] write /etc/apt/apt.conf.d/20auto-upgrades"
         else
             echo 'APT::Periodic::Update-Package-Lists "1";' > /etc/apt/apt.conf.d/20auto-upgrades
             echo 'APT::Periodic::Unattended-Upgrade "1";' >> /etc/apt/apt.conf.d/20auto-upgrades
@@ -1248,11 +1821,20 @@ configure_auto_updates() {
 
 disable_telemetry() {
     if [[ "$DISABLE_TELEMETRY" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        if [[ "$DETECTED_OS" == "debian" ]]; then
+            echo -e "${GREEN}[OK]${NC} Telemetry N/A on Debian — no ubuntu-report installed."
+            return 0
+        fi
         echo -ne "${YELLOW}[TUBSS] Disabling Ubuntu Telemetry... ${NC}"
         if grep -q "^enable = false" /etc/ubuntu-report/ubuntu-report.conf 2>/dev/null; then
             echo -e "  ${GREEN}[SKIP]${NC} Telemetry already disabled"
         elif [ -f /etc/ubuntu-report/ubuntu-report.conf ]; then
-            sed -i 's/^enable = true/enable = false/' /etc/ubuntu-report/ubuntu-report.conf
+            if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+                echo ""
+                echo "[DRY-RUN] sed -i 's/^enable = true/enable = false/' /etc/ubuntu-report/ubuntu-report.conf"
+            else
+                sed -i 's/^enable = true/enable = false/' /etc/ubuntu-report/ubuntu-report.conf
+            fi
             echo -e "${GREEN}[OK]${NC} Ubuntu telemetry disabled."
         else
             echo -e "${YELLOW}Warning: Ubuntu telemetry configuration file not found. Skipping.${NC}"
@@ -1325,6 +1907,26 @@ EOF
     # Final Prompt
     echo ""
     echo -e "$CLOSING_ART"
+
+    # P0: if netplan try/apply was deferred, a reboot is mandatory to pick up
+    # the static config. Warn loudly and default to yes — decline still
+    # allowed but clearly marked as dangerous.
+    if (( NETPLAN_APPLY_PENDING == 1 )); then
+        echo -e "${RED}!! A REBOOT IS REQUIRED !!${NC}"
+        echo -e "${YELLOW}TUBSS could not apply the new network configuration live (netplan try/apply deferred).${NC}"
+        echo -e "${YELLOW}Until you reboot, this host will keep using its previous DHCP/static settings.${NC}"
+    fi
+
+    if (( TUBSS_UNATTENDED == 1 )); then
+        if (( TUBSS_DRY_RUN == 1 )); then
+            echo -e "${YELLOW}[DRY-RUN]${NC} Skipping reboot in dry-run mode."
+        else
+            echo -e "${YELLOW}Rebooting the system now (unattended) to apply all changes.${NC}"
+            reboot
+        fi
+        return
+    fi
+
     read -p "Configuration is complete. Would you like to reboot the system now? (yes/no) [yes]: " REBOOT_PROMPT
     REBOOT_PROMPT=${REBOOT_PROMPT:-yes}
 
@@ -1332,7 +1934,11 @@ EOF
         echo -e "${YELLOW}Rebooting the system now to apply all changes.${NC}"
         reboot
     else
-        echo -e "${YELLOW}Reboot has been skipped. Please reboot the system manually for all changes to take effect.${NC}"
+        if (( NETPLAN_APPLY_PENDING == 1 )); then
+            echo -e "${RED}[WARN]${NC} Reboot skipped — static network config is NOT active yet. Reboot ASAP."
+        else
+            echo -e "${YELLOW}Reboot has been skipped. Please reboot the system manually for all changes to take effect.${NC}"
+        fi
     fi
 }
 

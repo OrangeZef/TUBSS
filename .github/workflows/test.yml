@@ -1,0 +1,44 @@
+name: Container Tests
+on:
+  pull_request:
+    paths: ['**.sh', 'test/**', '.github/workflows/test.yml']
+  push:
+    branches: [main]
+    paths: ['**.sh', 'test/**']
+  workflow_dispatch:
+jobs:
+  container-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-24.04
+            dockerfile: test/Dockerfile
+            script_path: /usr/local/bin/tubss_setup.sh
+          - name: ubuntu-22.04
+            dockerfile: test/Dockerfile.2204
+            script_path: /usr/local/bin/tubss_setup.sh
+          - name: debian-12
+            dockerfile: test/Dockerfile.debian12
+            script_path: /root/tubss_setup.sh
+          - name: debian-13
+            dockerfile: test/Dockerfile.debian13
+            script_path: /root/tubss_setup.sh
+          - name: debian-14
+            dockerfile: test/Dockerfile.debian14
+            script_path: /root/tubss_setup.sh
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -f ${{ matrix.dockerfile }} -t tubss-${{ matrix.name }} .
+      - name: Syntax check
+        run: docker run --rm tubss-${{ matrix.name }} bash -n ${{ matrix.script_path }}
+      - name: Shellcheck
+        run: docker run --rm tubss-${{ matrix.name }} bash -c "command -v shellcheck && shellcheck -S warning ${{ matrix.script_path }} || echo 'shellcheck not installed, skipping'"
+      - name: Help smoke
+        run: docker run --rm tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --help
+      - name: Version smoke
+        run: docker run --rm tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --version
+      - name: Dry-run smoke
+        run: docker run --rm tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --unattended --dry-run
