@@ -7,6 +7,7 @@ The script auto-detects OS/version via `/etc/os-release` — a single `tubss_set
 ### Features
 
 - **Automated Security:** Installs and configures essential tools like UFW and Fail2ban.
+- **Optional SSH hardening (opt-in):** Disable key-less auth, root login, X11 forwarding, and empty credentials with safety checks that refuse to lock you out.
 - **Networking:** Sets up network configuration, supporting both DHCP and static IP addresses.
 - **Essential Tools:** Installs key utilities (Git, NFS, SMB) by default.
 - **System Health:** Configures automatic security updates.

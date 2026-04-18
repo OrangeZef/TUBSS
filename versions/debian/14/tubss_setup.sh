@@ -2,7 +2,7 @@
 
 #==============================================================================
 # The Ubuntu/Debian Basic Setup Script (TUBSS)
-# Version: 2.6 (CC-103: unified OS detection, netplan try, CLI flags, logging)
+# Version: 2.7 (CC-104: SSH hardening + 5 infra-critical fixes)
 # Author: OrangeZef
 #
 # This script automates the initial setup and hardening of a new Ubuntu or
@@ -52,6 +52,20 @@
 # - [v2.6] CC-103 P5: single script covers Ubuntu + Debian via os-release
 #          branching (SUPPORTED_VERSIONS, package server, fetch tool, network
 #          renderer). versions/ tree retained as safety net.
+# - [v2.7] CC-104: Opt-in SSH hardening (key-only auth, no-root, no-X11,
+#          no-empty-password) honoured only in manual mode.
+# - [v2.7] CC-104 Fix A: `netplan try` skipped when stdin is not a TTY —
+#          defers apply to reboot rather than risking silent revert.
+# - [v2.7] CC-104 Fix B: main() refuses to run without a TTY unless
+#          --unattended is set; defends against curl|bash invocations.
+# - [v2.7] CC-104 Fix C: STATUS=pending_reboot when the user declines a
+#          reboot with NETPLAN_APPLY_PENDING=1; configure_network refuses
+#          to skip when prior state was pending_reboot.
+# - [v2.7] CC-104 Fix D: refuse to run --unattended + static IP unless
+#          TUBSS_FORCE_REBOOT=1 acknowledges the remote-lockout risk.
+# - [v2.7] CC-104 Fix E: dry-run no longer performs real mutations on the
+#          interactive static-IP path (cloud-init disable, backup dir
+#          mkdir, conflicting netplan mv, reboot calls).
 #
 # Provided by Joka.ca
 #==============================================================================
@@ -128,6 +142,17 @@ NEW_GIT_SUMMARY=""
 NEW_IP_ADDRESS_SUMMARY=""
 NEW_GATEWAY_SUMMARY=""
 NEW_DNS_SUMMARY=""
+NEW_SSH_HARDENING_SUMMARY=""
+
+# --- SSH hardening toggles (CC-104) ---
+# Feature is OFF by default. When SSH_HARDENING="yes", the individual
+# toggles below determine which sshd settings are applied. --unattended
+# keeps SSH_HARDENING="no" to avoid silent SSH lockout.
+SSH_HARDENING="no"
+SSH_DISABLE_PW_AUTH="yes"
+SSH_DISABLE_ROOT="yes"
+SSH_DISABLE_X11="yes"
+SSH_DISABLE_EMPTY_PW="yes"
 
 # --- Custom UFW rules array ---
 # Elements: "port|protocol|direction|description"
@@ -158,7 +183,7 @@ ORIGINAL_IP=""
 NETPLAN_APPLY_PENDING=0        # P0: forces reboot if netplan try/apply failed
 
 # --- Run-state persistence ---
-TUBSS_SCRIPT_VERSION="2.6"
+TUBSS_SCRIPT_VERSION="2.7"
 TUBSS_STATE_DIR="/var/lib/tubss"
 TUBSS_STATE_FILE="/var/lib/tubss/last_run"
 CURRENT_STEP=""
@@ -170,6 +195,7 @@ TUBSS_UNATTENDED=${TUBSS_UNATTENDED:-0}
 TUBSS_DRY_RUN=${TUBSS_DRY_RUN:-0}
 TUBSS_NO_LOG=${TUBSS_NO_LOG:-0}
 TUBSS_TTY=${TUBSS_TTY:-1}
+TUBSS_FORCE_REBOOT=${TUBSS_FORCE_REBOOT:-0}
 TUBSS_ROLLBACK=0
 
 
@@ -345,14 +371,28 @@ Options:
       --              Stop parsing options.
 
 Environment:
-  TUBSS_UNATTENDED=1  Equivalent to --unattended.
-  TUBSS_DRY_RUN=1     Equivalent to --dry-run.
-  TUBSS_NO_LOG=1      Skip log redirection to /var/log/tubss.log.
+  TUBSS_UNATTENDED=1    Equivalent to --unattended.
+  TUBSS_DRY_RUN=1       Equivalent to --dry-run.
+  TUBSS_NO_LOG=1        Skip log redirection to /var/log/tubss.log.
+  TUBSS_FORCE_REBOOT=1  Acknowledge remote-lockout risk and allow
+                        --unattended with static IP configuration.
+                        Required only when NET_TYPE=static is combined
+                        with --unattended (auto-reboot path).
 
 Examples:
   sudo tubss_setup.sh
   sudo tubss_setup.sh --unattended
   TUBSS_DRY_RUN=1 sudo -E tubss_setup.sh --unattended
+
+Features:
+  - UFW firewall (with optional custom rules), Fail2ban, automatic
+    security updates, optional AD domain join, NFS/SMB/Git clients,
+    telemetry disable, static or DHCP networking.
+  - Optional SSH hardening (opt-in, default OFF): disable password
+    auth (only if authorized_keys exists), disable root login,
+    disable X11 forwarding, disable empty passwords. Honoured only
+    in manual mode — --unattended keeps SSH hardening disabled to
+    avoid silent lockout.
 
 Provided by Joka.ca
 USAGE
@@ -490,6 +530,19 @@ main() {
     # writable — force TUBSS_NO_LOG to keep the smoke test side-effect-free.
     if [[ $EUID -ne 0 ]]; then
         TUBSS_NO_LOG=1
+    fi
+
+    # CC-104 Fix B: Guard against curl|bash / no-TTY invocations in interactive
+    # mode. --unattended is allowed (uses defaults, no prompts needed). Without
+    # a TTY, `read -p` prompts silently take defaults (or loop forever on
+    # validated inputs) — refuse loudly rather than ship a half-configured box.
+    if [[ ${TUBSS_UNATTENDED:-0} -ne 1 ]] && [[ ! -t 0 ]]; then
+        echo -e "${RED}[ERROR]${NC} TUBSS requires an interactive TTY for configuration prompts." >&2
+        echo -e "${RED}[ERROR]${NC} Don't run via 'curl | bash'. Download first, then execute:" >&2
+        echo -e "  curl -fsSL <url> -o tubss_setup.sh && sudo bash tubss_setup.sh" >&2
+        echo -e "${RED}[ERROR]${NC} Or use --unattended to skip prompts (defaults: DHCP, all services enabled)." >&2
+        trap - EXIT ERR
+        exit 3
     fi
 
     setup_logging "$@"
@@ -888,6 +941,9 @@ get_user_configuration() {
         INSTALL_NFS="yes"
         INSTALL_SMB="yes"
         INSTALL_GIT="yes"
+        # SSH hardening stays OFF in default / unattended mode to avoid
+        # silent SSH lockout. Users must opt in via manual mode.
+        SSH_HARDENING="no"
     else
         read -p "Do you want to install Webmin? (yes/no) [no]: " INSTALL_WEBMIN
         INSTALL_WEBMIN=${INSTALL_WEBMIN:-no}
@@ -899,6 +955,30 @@ get_user_configuration() {
         INSTALL_FAIL2BAN=${INSTALL_FAIL2BAN:-yes}
         read -p "Do you want to disable optional telemetry and analytics? (yes/no) [yes]: " DISABLE_TELEMETRY
         DISABLE_TELEMETRY=${DISABLE_TELEMETRY:-yes}
+
+        # SSH hardening (CC-104) — opt-in, default N. Only in manual mode.
+        read -p "Enable SSH hardening (sshd_config tightening)? (yes/no) [no]: " SSH_HARDENING
+        SSH_HARDENING=${SSH_HARDENING:-no}
+        SSH_HARDENING=$(echo "$SSH_HARDENING" | tr '[:upper:]' '[:lower:]')
+        if [[ "$SSH_HARDENING" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+            SSH_HARDENING="yes"
+            echo -e "${YELLOW}--- SSH Hardening Options ---${NC}"
+            echo -e "${YELLOW}Disabling key-less auth will lock out users without an SSH key.${NC}"
+            read -p "  Disable key-less auth (key-only login)? (yes/no) [yes]: " SSH_DISABLE_PW_AUTH
+            SSH_DISABLE_PW_AUTH=${SSH_DISABLE_PW_AUTH:-yes}
+            read -p "  Disable root login over SSH? (yes/no) [yes]: " SSH_DISABLE_ROOT
+            SSH_DISABLE_ROOT=${SSH_DISABLE_ROOT:-yes}
+            read -p "  Disable X11 forwarding? (yes/no) [yes]: " SSH_DISABLE_X11
+            SSH_DISABLE_X11=${SSH_DISABLE_X11:-yes}
+            read -p "  Disable empty credentials? (yes/no) [yes]: " SSH_DISABLE_EMPTY_PW
+            SSH_DISABLE_EMPTY_PW=${SSH_DISABLE_EMPTY_PW:-yes}
+            SSH_DISABLE_PW_AUTH=$(echo "$SSH_DISABLE_PW_AUTH" | tr '[:upper:]' '[:lower:]')
+            SSH_DISABLE_ROOT=$(echo "$SSH_DISABLE_ROOT" | tr '[:upper:]' '[:lower:]')
+            SSH_DISABLE_X11=$(echo "$SSH_DISABLE_X11" | tr '[:upper:]' '[:lower:]')
+            SSH_DISABLE_EMPTY_PW=$(echo "$SSH_DISABLE_EMPTY_PW" | tr '[:upper:]' '[:lower:]')
+        else
+            SSH_HARDENING="no"
+        fi
 
         if [ "$ORIGINAL_DOMAIN_STATUS" != "Not Joined" ]; then
             echo -e "${YELLOW}Your system is currently joined to the domain: ${ORIGINAL_DOMAIN_STATUS}${NC}"
@@ -1045,6 +1125,7 @@ display_config_summary() {
     fi
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Auto Updates Status:${NC}" "${ORIGINAL_AUTO_UPDATES_STATUS}" "${NEW_AUTO_UPDATES_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Fail2ban Status:${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "${NEW_FAIL2BAN_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}SSH Hardening:${NC}" "default" "${NEW_SSH_HARDENING_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "${NEW_TELEMETRY_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}AD Domain Join:${NC}" "${ORIGINAL_DOMAIN_STATUS:-Not Joined}" "${NEW_DOMAIN_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}NFS Client Status:${NC}" "${ORIGINAL_NFS_STATUS}" "${NEW_NFS_SUMMARY}"
@@ -1065,6 +1146,22 @@ show_summary_and_confirm() {
     NEW_NFS_SUMMARY=$(if [[ "$INSTALL_NFS" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
     NEW_SMB_SUMMARY=$(if [[ "$INSTALL_SMB" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
     NEW_GIT_SUMMARY=$(if [[ "$INSTALL_GIT" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
+
+    # SSH hardening summary: list enabled toggles, or "Disabled"
+    if [[ "$SSH_HARDENING" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        local _ssh_parts=()
+        [[ "$SSH_DISABLE_PW_AUTH"   =~ ^([yY][eE][sS]|[yY])$ ]] && _ssh_parts+=("key-only")
+        [[ "$SSH_DISABLE_ROOT"      =~ ^([yY][eE][sS]|[yY])$ ]] && _ssh_parts+=("no-root")
+        [[ "$SSH_DISABLE_X11"       =~ ^([yY][eE][sS]|[yY])$ ]] && _ssh_parts+=("no-x11")
+        [[ "$SSH_DISABLE_EMPTY_PW"  =~ ^([yY][eE][sS]|[yY])$ ]] && _ssh_parts+=("no-empty")
+        if (( ${#_ssh_parts[@]} > 0 )); then
+            NEW_SSH_HARDENING_SUMMARY=$(IFS=,; echo "${_ssh_parts[*]}")
+        else
+            NEW_SSH_HARDENING_SUMMARY="Enabled (no opts)"
+        fi
+    else
+        NEW_SSH_HARDENING_SUMMARY="Disabled"
+    fi
 
     NEW_IP_ADDRESS_SUMMARY=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$STATIC_IP/$NETMASK_CIDR"; else echo "N/A"; fi)
     NEW_GATEWAY_SUMMARY=$(if [[ "$NET_TYPE" == "static" ]]; then echo "$GATEWAY"; else echo "N/A"; fi)
@@ -1114,6 +1211,14 @@ display_prior_run_state() {
     if [[ "$status" == "completed" ]]; then
         echo -e "  Status:      ${GREEN}completed${NC}"
         echo -e "  Finished:    ${end:-unknown}"
+    elif [[ "$status" == "pending_reboot" ]]; then
+        # CC-104 Fix C: loud warning — the running kernel is NOT yet on the
+        # declared config. User needs to reboot before trusting this host.
+        echo -e "  Status:      ${YELLOW}pending_reboot${NC}"
+        echo -e "  Finished:    ${end:-unknown}"
+        echo -e "  ${YELLOW}>>> Previous run completed but a reboot is still required.${NC}"
+        echo -e "  ${YELLOW}>>> The live network config does NOT match the written config.${NC}"
+        echo -e "  ${YELLOW}>>> Reboot this host (sudo reboot) before relying on it.${NC}"
     elif [[ "$status" == "failed" ]]; then
         if [[ -n "$failed_step" ]]; then
             echo -e "  Status:      ${RED}failed${NC}"
@@ -1164,13 +1269,33 @@ mark_run_state_failed() {
 }
 
 finalize_run_state() {
+    # CC-104 Fix C: accept an optional status override. Callers pass
+    # "pending_reboot" when the user declines a reboot while
+    # NETPLAN_APPLY_PENDING=1, so the state file reflects reality and the
+    # next run's "config already exists — skipping" shortcut does not make
+    # the bad state permanent.
+    local state=${1:-completed}
     [[ ! -f "$TUBSS_STATE_FILE" ]] && return 0
-    sed -i "s|^STATUS=.*|STATUS=completed|" "$TUBSS_STATE_FILE"
+    sed -i "s|^STATUS=.*|STATUS=${state}|" "$TUBSS_STATE_FILE"
     sed -i "s|^RUN_END=.*|RUN_END=$(date -Iseconds)|" "$TUBSS_STATE_FILE"
 }
 
 # --- Step 4: Apply Configuration ---
 apply_configuration() {
+    # CC-104 Fix D: Unattended + static IP = remote-lockout risk on auto-reboot.
+    # Require explicit TUBSS_FORCE_REBOOT=1 opt-in to proceed. Dry-run is fine
+    # (no real mutations), so only gate the live path.
+    if (( TUBSS_UNATTENDED == 1 )) \
+        && [[ "${NET_TYPE:-}" == "static" ]] \
+        && [[ "${TUBSS_FORCE_REBOOT:-0}" != "1" ]] \
+        && (( TUBSS_DRY_RUN != 1 )); then
+        echo -e "${RED}[ERROR]${NC} Refusing to run unattended with static IP configuration." >&2
+        echo -e "${RED}[ERROR]${NC} This combination risks remote lockout on bad config." >&2
+        echo -e "${RED}[ERROR]${NC} Set TUBSS_FORCE_REBOOT=1 env var to acknowledge and proceed." >&2
+        trap - EXIT ERR
+        exit 4
+    fi
+
     init_run_state
 
     CURRENT_STEP="configure_snapshot"
@@ -1192,6 +1317,12 @@ apply_configuration() {
     CURRENT_STEP="configure_fail2ban"
     configure_fail2ban
     update_run_state_step "configure_fail2ban"
+
+    # CC-104: SSH hardening runs AFTER fail2ban so fail2ban protects SSH
+    # even if hardening fails. Feature is opt-in (default OFF).
+    CURRENT_STEP="ssh_hardening"
+    configure_ssh_hardening
+    update_run_state_step "ssh_hardening"
 
     CURRENT_STEP="configure_auto_updates"
     configure_auto_updates
@@ -1478,6 +1609,19 @@ _netplan_apply_or_try() {
         return 0
     fi
 
+    # CC-104 Fix A: `netplan try` requires an interactive TTY to confirm the
+    # config. With stdin redirected or no controlling terminal, some netplan
+    # builds silently revert BUT exit 0 — which falsely reports "applied live"
+    # and leaves the host running the old config. Skip `try` entirely in that
+    # case and defer apply to reboot (safer for remote sessions). The config
+    # file is already written; reboot will activate it.
+    if [[ ! -t 0 ]]; then
+        echo -e "  ${YELLOW}[NETPLAN]${NC} No TTY available — skipping 'netplan try' (requires interactive confirm)."
+        echo -e "  ${YELLOW}[NETPLAN]${NC} Will defer apply to reboot (safer for remote sessions)."
+        NETPLAN_APPLY_PENDING=1
+        return 0
+    fi
+
     # Detect whether `netplan try` is supported on this distro version.
     # Merge stderr into stdout: some netplan builds print --help to stderr, and
     # the flag may appear as `--timeout=SECS` — match on the literal `--timeout`.
@@ -1549,35 +1693,73 @@ configure_network() {
             echo -e "${YELLOW}[SKIPPED]${NC} Already using DHCP."
         fi
     else
-        if [[ -f "$network_config_file" ]]; then
+        # CC-104 Fix C/M1: if the previous run left the box in pending_reboot
+        # state, DO NOT short-circuit on "config already exists" — the config
+        # was never actually applied to the running kernel AND the user may
+        # have just supplied corrected IP/gateway values in this session.
+        # Remove the stale file and fall through to the normal write path so
+        # the fresh prompt answers are honoured.
+        local prior_status=""
+        if [[ -r "$TUBSS_STATE_FILE" ]]; then
+            prior_status=$(grep '^STATUS=' "$TUBSS_STATE_FILE" 2>/dev/null | cut -d= -f2)
+        fi
+        if [[ "$prior_status" == "pending_reboot" ]]; then
+            if [[ -f "$network_config_file" ]]; then
+                echo -e "  ${YELLOW}[NETPLAN]${NC} Prior run left reboot pending — regenerating config from current session values."
+                if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+                    echo "  [DRY-RUN] Would remove stale $network_config_file"
+                else
+                    rm -f "$network_config_file"
+                fi
+            fi
+            # Fall through to the normal write path below.
+        elif [[ -f "$network_config_file" ]]; then
             echo -e "  ${GREEN}[SKIP]${NC} Static network config already exists — skipping."
             echo -e "  ${YELLOW}[WARN]${NC} If you added netplan files since the last run, delete /etc/netplan/01-static-network.yaml and re-run to trigger cleanup."
-        else
-            warn_if_gateway_unreachable
-            # P0: Validate gateway is inside the chosen subnet BEFORE writing
-            # anything. Refuse with a clear error otherwise.
-            if ! validate_gateway_in_subnet "$STATIC_IP" "$NETMASK_CIDR" "$GATEWAY"; then
-                exit 1
-            fi
-            # P0: Disable cloud-init network management FIRST so it cannot
-            # race with our write or overwrite on next boot.
-            disable_cloud_init_network
+            return 0
+        fi
 
-            # Backup and remove conflicting netplan configs to prevent IP merging
-            local backup_timestamp
-            backup_timestamp=$(date +%Y%m%d-%H%M%S)
-            local backup_dir="/etc/netplan/tubss-backup/${backup_timestamp}"
+        warn_if_gateway_unreachable
+        # P0: Validate gateway is inside the chosen subnet BEFORE writing
+        # anything. Refuse with a clear error otherwise.
+        if ! validate_gateway_in_subnet "$STATIC_IP" "$NETMASK_CIDR" "$GATEWAY"; then
+            exit 1
+        fi
+        # P0: Disable cloud-init network management FIRST so it cannot
+        # race with our write or overwrite on next boot.
+        # CC-104 Fix E: honour dry-run on the interactive static-IP path —
+        # cloud-init override, backup dir mkdir, and netplan mv are real
+        # mutations that were leaking through dry-run.
+        if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+            echo "[DRY-RUN] disable_cloud_init_network (write /etc/cloud/cloud.cfg.d/99-tubss-disable-network.cfg)"
+        else
+            disable_cloud_init_network
+        fi
+
+        # Backup and remove conflicting netplan configs to prevent IP merging
+        local backup_timestamp
+        backup_timestamp=$(date +%Y%m%d-%H%M%S)
+        local backup_dir="/etc/netplan/tubss-backup/${backup_timestamp}"
+        if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+            echo "[DRY-RUN] mkdir -p ${backup_dir}"
+        else
             mkdir -p "$backup_dir"
-            for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
-                [[ -f "$f" ]] || continue
-                [[ "$f" == "$network_config_file" ]] && continue
+        fi
+        for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+            [[ -f "$f" ]] || continue
+            [[ "$f" == "$network_config_file" ]] && continue
+            if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+                echo "[DRY-RUN] mv $f ${backup_dir}/"
+                echo -e "  ${YELLOW}[NETPLAN]${NC} Would back up conflicting config: $(basename "$f") (dry-run)"
+            else
                 mv "$f" "$backup_dir/"
                 echo -e "  ${YELLOW}[NETPLAN]${NC} Backed up conflicting config: $(basename "$f")"
-            done
-            if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
-                echo "[DRY-RUN] write netplan static config to $network_config_file"
-            else
-                cat << EOF > "$network_config_file"
+            fi
+        done
+        if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+            echo "[DRY-RUN] write netplan static config to $network_config_file"
+        else
+            cat << EOF > "$network_config_file"
 network:
   version: 2
   renderer: networkd
@@ -1591,18 +1773,17 @@ network:
       nameservers:
         addresses: [$DNS_SERVER]
 EOF
-                # Keep the static config root-only to match the rest of /etc/netplan.
-                chmod 600 "$network_config_file" 2>/dev/null || true
-            fi
-            # P0: attempt to apply immediately via `netplan try` (auto-reverts
-            # on SSH loss). Falls back to `netplan apply` or sets the
-            # deferred-reboot flag.
-            _netplan_apply_or_try
-            if (( NETPLAN_APPLY_PENDING == 1 )); then
-                echo -e "${YELLOW}[OK]${NC} Static IP config written for '$INTERFACE_NAME' — reboot required to activate."
-            else
-                echo -e "${GREEN}[OK]${NC} Static IP config applied for '$INTERFACE_NAME'."
-            fi
+            # Keep the static config root-only to match the rest of /etc/netplan.
+            chmod 600 "$network_config_file" 2>/dev/null || true
+        fi
+        # P0: attempt to apply immediately via `netplan try` (auto-reverts
+        # on SSH loss). Falls back to `netplan apply` or sets the
+        # deferred-reboot flag.
+        _netplan_apply_or_try
+        if (( NETPLAN_APPLY_PENDING == 1 )); then
+            echo -e "${YELLOW}[OK]${NC} Static IP config written for '$INTERFACE_NAME' — reboot required to activate."
+        else
+            echo -e "${GREEN}[OK]${NC} Static IP config applied for '$INTERFACE_NAME'."
         fi
     fi
 }
@@ -1803,6 +1984,177 @@ EOF
     fi
 }
 
+# --- CC-104: Opt-in SSH hardening ---
+# Applies a drop-in /etc/ssh/sshd_config.d/99-tubss-hardening.conf when
+# the distro supports sshd_config.d, otherwise edits /etc/ssh/sshd_config
+# in place via sed. Always backs up /etc/ssh/sshd_config before editing,
+# validates with `sshd -t`, and reloads (not restarts) the ssh daemon.
+#
+# Safety rails:
+#   * Refuses to disable key-less auth if no authorized_keys exists for
+#     the invoking user (or root when root login is disabled).
+#   * Restores the backup if `sshd -t` fails.
+configure_ssh_hardening() {
+    update_run_state_step "ssh_hardening"
+
+    if [[ ! "$SSH_HARDENING" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        echo -e "${YELLOW}[SKIP] SSH hardening disabled${NC}"
+        return 0
+    fi
+
+    echo -e "${YELLOW}[TUBSS] Applying SSH hardening...${NC}"
+
+    local sshd_config="/etc/ssh/sshd_config"
+    local sshd_d_dir="/etc/ssh/sshd_config.d"
+    local dropin="${sshd_d_dir}/99-tubss-hardening.conf"
+    local backup_ts
+    backup_ts=$(date +%Y%m%d%H%M)
+    local backup="${sshd_config}.tubss.bak.${backup_ts}"
+
+    # --- Safety: verify authorized_keys exists before disabling key-less auth ---
+    local disable_pw_auth="no"
+    if [[ "$SSH_DISABLE_PW_AUTH" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+        local invoking_user invoking_home auth_keys_found=0
+        invoking_user="${SUDO_USER:-${USER:-root}}"
+        if [[ "$invoking_user" == "root" ]]; then
+            invoking_home="/root"
+        else
+            invoking_home=$(getent passwd "$invoking_user" 2>/dev/null | cut -d: -f6)
+        fi
+        if [[ -n "$invoking_home" && -s "${invoking_home}/.ssh/authorized_keys" ]]; then
+            auth_keys_found=1
+        fi
+        # If root login will remain enabled, also accept /root/.ssh/authorized_keys
+        if (( auth_keys_found == 0 )) && [[ ! "$SSH_DISABLE_ROOT" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+            if [[ -s /root/.ssh/authorized_keys ]]; then
+                auth_keys_found=1
+            fi
+        fi
+        if (( auth_keys_found == 1 )); then
+            disable_pw_auth="yes"
+        else
+            echo -e "  ${YELLOW}[SAFETY]${NC} No authorized_keys found for '${invoking_user}' — refusing to disable key-less auth (would lock you out)."
+        fi
+    fi
+
+    # CC-104 Fix M2: prefer the drop-in ONLY if sshd_config actually Includes
+    # /etc/ssh/sshd_config.d/*.conf. On hosts where the Include directive was
+    # removed, the drop-in would be silently ignored — fall back to editing
+    # sshd_config directly so hardening actually takes effect.
+    local use_dropin=0
+    if [[ -d "$sshd_d_dir" ]]; then
+        if grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$sshd_config" 2>/dev/null; then
+            use_dropin=1
+        else
+            echo -e "  ${YELLOW}[SSH]${NC} sshd_config does not Include sshd_config.d — falling back to in-place edit."
+        fi
+    fi
+
+    # --- Dry-run: announce intent and return ---
+    if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo "[DRY-RUN] cp ${sshd_config} ${backup}"
+        if (( use_dropin == 1 )); then
+            echo "[DRY-RUN] write drop-in ${dropin}"
+        else
+            echo "[DRY-RUN] sed -i edits on ${sshd_config}"
+        fi
+        [[ "$disable_pw_auth" == "yes" ]]                              && echo "[DRY-RUN]   set PasswordAuthentication no"
+        [[ "$SSH_DISABLE_ROOT"     =~ ^([yY][eE][sS]|[yY])$ ]]         && echo "[DRY-RUN]   set PermitRootLogin no"
+        [[ "$SSH_DISABLE_X11"      =~ ^([yY][eE][sS]|[yY])$ ]]         && echo "[DRY-RUN]   set X11Forwarding no"
+        [[ "$SSH_DISABLE_EMPTY_PW" =~ ^([yY][eE][sS]|[yY])$ ]]         && echo "[DRY-RUN]   set PermitEmptyPasswords no"
+        echo "[DRY-RUN] sshd -t -f ${sshd_config}"
+        echo "[DRY-RUN] systemctl reload ssh (or sshd)"
+        return 0
+    fi
+
+    # --- Backup sshd_config ---
+    if [[ -f "$sshd_config" ]]; then
+        cp -a "$sshd_config" "$backup"
+        echo -e "  ${GREEN}[OK]${NC} Backed up ${sshd_config} -> ${backup}"
+    else
+        echo -e "  ${YELLOW}[WARN]${NC} ${sshd_config} not found — aborting SSH hardening."
+        return 0
+    fi
+
+    # --- Build desired setting list ---
+    local -a settings=()
+    [[ "$disable_pw_auth" == "yes" ]]                      && settings+=("PasswordAuthentication no")
+    [[ "$SSH_DISABLE_ROOT"     =~ ^([yY][eE][sS]|[yY])$ ]] && settings+=("PermitRootLogin no")
+    [[ "$SSH_DISABLE_X11"      =~ ^([yY][eE][sS]|[yY])$ ]] && settings+=("X11Forwarding no")
+    [[ "$SSH_DISABLE_EMPTY_PW" =~ ^([yY][eE][sS]|[yY])$ ]] && settings+=("PermitEmptyPasswords no")
+
+    if (( ${#settings[@]} == 0 )); then
+        echo -e "  ${YELLOW}[SKIP]${NC} No SSH hardening options selected (or all blocked by safety checks)."
+        return 0
+    fi
+
+    # --- Apply: prefer drop-in (only if sshd_config Includes it), fall back to sed-in-place ---
+    if (( use_dropin == 1 )); then
+        # Idempotency: if drop-in already contains the exact desired settings, skip write.
+        local want
+        want=$(printf '# TUBSS SSH hardening (CC-104)\n# Managed file — regenerate via tubss_setup.sh\n')
+        local s
+        for s in "${settings[@]}"; do
+            want+="${s}"$'\n'
+        done
+        if [[ -f "$dropin" ]] && [[ "$(cat "$dropin")" == "$want" ]]; then
+            echo -e "  ${GREEN}[SKIP]${NC} ${dropin} already matches desired state."
+        else
+            printf '%s' "$want" > "$dropin"
+            chmod 0644 "$dropin"
+            echo -e "  ${GREEN}[OK]${NC} Wrote drop-in ${dropin}"
+        fi
+    else
+        # In-place sed edit of sshd_config. Only modify lines that need changing.
+        local key value
+        for s in "${settings[@]}"; do
+            key="${s%% *}"
+            value="${s#* }"
+            if grep -Eq "^[[:space:]]*${key}[[:space:]]+${value}([[:space:]]|$)" "$sshd_config"; then
+                echo -e "  ${GREEN}[SKIP]${NC} ${key} already set to ${value}"
+                continue
+            fi
+            if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]" "$sshd_config"; then
+                sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*$|${key} ${value}|" "$sshd_config"
+            else
+                printf '\n# TUBSS SSH hardening (CC-104)\n%s\n' "$s" >> "$sshd_config"
+            fi
+            echo -e "  ${GREEN}[OK]${NC} Set ${key} ${value}"
+        done
+    fi
+
+    # --- Validate ---
+    if ! sshd -t -f "$sshd_config" 2>/dev/null; then
+        echo -e "  ${RED}[ERROR]${NC} sshd -t validation failed — restoring backup."
+        cp -a "$backup" "$sshd_config"
+        [[ -f "$dropin" ]] && rm -f "$dropin"
+        return 1
+    fi
+    echo -e "  ${GREEN}[OK]${NC} sshd configuration validated."
+
+    # --- Reload (NOT restart — preserves existing sessions) ---
+    local ssh_unit=""
+    if systemctl list-unit-files ssh.service >/dev/null 2>&1 && \
+       systemctl list-unit-files ssh.service 2>/dev/null | grep -q '^ssh\.service'; then
+        ssh_unit="ssh"
+    elif systemctl list-unit-files sshd.service >/dev/null 2>&1 && \
+         systemctl list-unit-files sshd.service 2>/dev/null | grep -q '^sshd\.service'; then
+        ssh_unit="sshd"
+    fi
+
+    if [[ -n "$ssh_unit" ]]; then
+        if systemctl reload "$ssh_unit" >/dev/null 2>&1; then
+            echo -e "  ${GREEN}[OK]${NC} Reloaded ${ssh_unit}.service (existing sessions preserved)."
+        else
+            echo -e "  ${YELLOW}[WARN]${NC} systemctl reload ${ssh_unit} failed — run it manually."
+        fi
+    else
+        echo -e "  ${YELLOW}[WARN]${NC} Could not locate ssh/sshd systemd unit — reload skipped."
+    fi
+
+    echo -e "${GREEN}[OK]${NC} SSH hardening applied."
+}
+
 configure_auto_updates() {
     if [[ "$ENABLE_AUTO_UPDATES" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo -ne "${YELLOW}[TUBSS] Enabling Automatic Security Updates... ${NC}"
@@ -1858,7 +2210,15 @@ join_ad_domain() {
 
 # --- Step 5: Final Summary and Reboot Prompt ---
 reboot_prompt() {
-    finalize_run_state
+    # CC-104 Fix C: finalize state depending on whether a reboot is pending.
+    # If netplan apply is deferred (NETPLAN_APPLY_PENDING=1), mark the state
+    # file as "pending_reboot" instead of "completed" so the next TUBSS run
+    # knows the box is not yet in the declared state.
+    if (( NETPLAN_APPLY_PENDING == 1 )); then
+        finalize_run_state "pending_reboot"
+    else
+        finalize_run_state
+    fi
     echo ""
     echo -e "${YELLOW}Configuration changes have been applied.${NC}"
     echo "A summary of the changes has been saved to: $SUMMARY_FILE"
@@ -1888,6 +2248,7 @@ UFW Status                   | $ORIGINAL_UFW_STATUS       | ${NEW_UFW_SUMMARY}
 Custom UFW Rules             | none                       | ${#CUSTOM_UFW_RULES[@]} rule(s)
 Auto Updates Status          | $ORIGINAL_AUTO_UPDATES_STATUS | ${NEW_AUTO_UPDATES_SUMMARY}
 Fail2ban Status              | $ORIGINAL_FAIL2BAN_STATUS  | ${NEW_FAIL2BAN_SUMMARY}
+SSH Hardening                | default                    | ${NEW_SSH_HARDENING_SUMMARY}
 Telemetry/Analytics          | $ORIGINAL_TELEMETRY_STATUS | ${NEW_TELEMETRY_SUMMARY}
 AD Domain Join               | ${ORIGINAL_DOMAIN_STATUS:-Not Joined} | ${NEW_DOMAIN_SUMMARY}
 NFS Client Status            | $ORIGINAL_NFS_STATUS       | ${NEW_NFS_SUMMARY}
@@ -1933,8 +2294,12 @@ EOF
     REBOOT_PROMPT=${REBOOT_PROMPT:-yes}
 
     if [[ "$REBOOT_PROMPT" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        echo -e "${YELLOW}Rebooting the system now to apply all changes.${NC}"
-        reboot
+        if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+            echo -e "${YELLOW}[DRY-RUN]${NC} Would reboot — skipping in dry-run mode."
+        else
+            echo -e "${YELLOW}Rebooting the system now to apply all changes.${NC}"
+            reboot
+        fi
     else
         if (( NETPLAN_APPLY_PENDING == 1 )); then
             echo -e "${RED}[WARN]${NC} Reboot skipped — static network config is NOT active yet. Reboot ASAP."
@@ -2107,8 +2472,12 @@ run_rollback_ui() {
     read -p "Would you like to reboot now? (yes/no) [no]: " do_reboot
     do_reboot=${do_reboot:-no}
     if [[ "$do_reboot" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        echo -e "${YELLOW}Rebooting...${NC}"
-        reboot
+        if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+            echo -e "${YELLOW}[DRY-RUN]${NC} Would reboot — skipping in dry-run mode."
+        else
+            echo -e "${YELLOW}Rebooting...${NC}"
+            reboot
+        fi
     else
         echo -e "${YELLOW}Please reboot manually when ready.${NC}"
     fi
