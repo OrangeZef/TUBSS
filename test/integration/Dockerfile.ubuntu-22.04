@@ -1,0 +1,15 @@
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive container=docker
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd systemd-sysv dbus curl sudo bash ca-certificates iproute2 \
+    iputils-ping netbase gnupg openssh-server \
+    && rm -rf /var/lib/apt/lists/*
+# Strip unnecessary systemd targets to speed boot
+RUN find /etc/systemd/system /lib/systemd/system -path '*.wants/*' \
+    \( -name '*getty*' -o -name '*udev*' -o -name '*timer*' \) -exec rm -f {} + || true
+COPY tubss_setup.sh /root/tubss_setup.sh
+COPY test/integration/run.sh /root/run.sh
+COPY test/integration/assertions.sh /root/assertions.sh
+RUN chmod +x /root/tubss_setup.sh /root/run.sh /root/assertions.sh
+STOPSIGNAL SIGRTMIN+3
+CMD ["/lib/systemd/systemd"]

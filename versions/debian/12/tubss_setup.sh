@@ -147,12 +147,14 @@ NEW_SSH_HARDENING_SUMMARY=""
 # --- SSH hardening toggles (CC-104) ---
 # Feature is OFF by default. When SSH_HARDENING="yes", the individual
 # toggles below determine which sshd settings are applied. --unattended
-# keeps SSH_HARDENING="no" to avoid silent SSH lockout.
-SSH_HARDENING="no"
-SSH_DISABLE_PW_AUTH="yes"
-SSH_DISABLE_ROOT="yes"
-SSH_DISABLE_X11="yes"
-SSH_DISABLE_EMPTY_PW="yes"
+# keeps SSH_HARDENING="no" to avoid silent SSH lockout, UNLESS the caller
+# has pre-seeded SSH_HARDENING=yes in the environment (documented opt-in
+# for integration tests / automation).
+SSH_HARDENING="${SSH_HARDENING:-no}"
+SSH_DISABLE_PW_AUTH="${SSH_DISABLE_PW_AUTH:-yes}"
+SSH_DISABLE_ROOT="${SSH_DISABLE_ROOT:-yes}"
+SSH_DISABLE_X11="${SSH_DISABLE_X11:-yes}"
+SSH_DISABLE_EMPTY_PW="${SSH_DISABLE_EMPTY_PW:-yes}"
 
 # --- Custom UFW rules array ---
 # Elements: "port|protocol|direction|description"
@@ -196,6 +198,7 @@ TUBSS_DRY_RUN=${TUBSS_DRY_RUN:-0}
 TUBSS_NO_LOG=${TUBSS_NO_LOG:-0}
 TUBSS_TTY=${TUBSS_TTY:-1}
 TUBSS_FORCE_REBOOT=${TUBSS_FORCE_REBOOT:-0}
+TUBSS_SKIP_REBOOT=${TUBSS_SKIP_REBOOT:-0}
 TUBSS_ROLLBACK=0
 
 
@@ -340,6 +343,13 @@ cleanup() {
     # Revert terminal colors
     echo -e "${NC}\033[0m"
     echo "===== TUBSS run ended rc=${rc} ====="
+    # Flush the log pipeline: close stdout/stderr and wait for the tee subshell
+    # to drain before returning. Without this, the final markers may be lost to
+    # tee teardown in non-TTY contexts (containers, CI).
+    if [[ -n "${TUBSS_TEE_PID:-}" ]]; then
+        exec 1>&- 2>&- || true
+        wait "$TUBSS_TEE_PID" 2>/dev/null || true
+    fi
 }
 
 # --- Set traps for error handling and cleanup ---
@@ -378,6 +388,14 @@ Environment:
                         --unattended with static IP configuration.
                         Required only when NET_TYPE=static is combined
                         with --unattended (auto-reboot path).
+  TUBSS_SKIP_REBOOT=1   Skip the final reboot in --unattended mode.
+                        Intended for integration tests / CI; the script
+                        otherwise reboots unconditionally in unattended
+                        mode when not in dry-run.
+  SSH_HARDENING=yes     Opt into SSH hardening in --unattended mode.
+                        Without this, --unattended forces hardening OFF
+                        to avoid silent SSH lockout. Safety checks still
+                        apply (key-only refusal when no authorized_keys).
 
 Examples:
   sudo tubss_setup.sh
@@ -457,6 +475,8 @@ setup_logging() {
     TUBSS_TTY=$([[ -t 1 ]] && echo 1 || echo 0)
     export TUBSS_TTY
     exec > >(while IFS= read -r line; do printf '%s %s\n' "$(date -Is)" "$line"; done | tee -a "$log") 2>&1
+    TUBSS_TEE_PID=$!
+    export TUBSS_TEE_PID
     echo "===== TUBSS run started $(date -Is) pid=$$ version=${TUBSS_SCRIPT_VERSION} argv=$* ====="
 }
 
@@ -942,8 +962,18 @@ get_user_configuration() {
         INSTALL_SMB="yes"
         INSTALL_GIT="yes"
         # SSH hardening stays OFF in default / unattended mode to avoid
-        # silent SSH lockout. Users must opt in via manual mode.
-        SSH_HARDENING="no"
+        # silent SSH lockout. Users must opt in via manual mode OR by
+        # pre-seeding SSH_HARDENING=yes in the environment (documented
+        # opt-in for integration tests / automation).
+        if [[ "${SSH_HARDENING:-}" == "yes" ]]; then
+            SSH_HARDENING="yes"
+            SSH_DISABLE_PW_AUTH="${SSH_DISABLE_PW_AUTH:-yes}"
+            SSH_DISABLE_ROOT="${SSH_DISABLE_ROOT:-yes}"
+            SSH_DISABLE_X11="${SSH_DISABLE_X11:-yes}"
+            SSH_DISABLE_EMPTY_PW="${SSH_DISABLE_EMPTY_PW:-yes}"
+        else
+            SSH_HARDENING="no"
+        fi
     else
         read -p "Do you want to install Webmin? (yes/no) [no]: " INSTALL_WEBMIN
         INSTALL_WEBMIN=${INSTALL_WEBMIN:-no}
@@ -2283,6 +2313,8 @@ EOF
     if (( TUBSS_UNATTENDED == 1 )); then
         if (( TUBSS_DRY_RUN == 1 )); then
             echo -e "${YELLOW}[DRY-RUN]${NC} Skipping reboot in dry-run mode."
+        elif (( ${TUBSS_SKIP_REBOOT:-0} == 1 )); then
+            echo -e "${YELLOW}[TUBSS]${NC} TUBSS_SKIP_REBOOT=1 — skipping reboot (test mode)"
         else
             echo -e "${YELLOW}Rebooting the system now (unattended) to apply all changes.${NC}"
             reboot

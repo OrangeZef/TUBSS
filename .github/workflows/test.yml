@@ -40,5 +40,17 @@ jobs:
         run: docker run --rm tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --help
       - name: Version smoke
         run: docker run --rm tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --version
-      - name: Dry-run smoke
-        run: docker run --rm tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --unattended --dry-run
+      - name: Dry-run smoke with output markers
+        run: |
+          out=$(docker run --rm tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --unattended --dry-run 2>&1)
+          echo "$out"
+          # Confirm dry-run was honored (otherwise script actually mutated state)
+          echo "$out" | grep -q '\[DRY-RUN\]' || { echo "::error::No [DRY-RUN] markers found"; exit 1; }
+          # Core subsystems ran
+          echo "$out" | grep -qE '(Installing packages|Package lists updated)' || { echo "::error::Package install step missing"; exit 1; }
+          echo "$out" | grep -q 'Configuring UFW' || { echo "::error::UFW step missing"; exit 1; }
+          echo "$out" | grep -q 'Configuring Fail2ban' || { echo "::error::Fail2ban step missing"; exit 1; }
+          # SSH hardening default is OFF — must appear as skipped/disabled
+          echo "$out" | grep -qE '(SSH hardening disabled|SKIP\].*SSH)' || { echo "::error::SSH hardening block missing"; exit 1; }
+          # Clean exit marker
+          echo "$out" | grep -qE 'TUBSS run ended rc=0' || { echo "::error::Missing clean-exit log marker"; exit 1; }
