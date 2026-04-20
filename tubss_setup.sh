@@ -480,6 +480,54 @@ setup_logging() {
     echo "===== TUBSS run started $(date -Is) pid=$$ version=${TUBSS_SCRIPT_VERSION} argv=$* ====="
 }
 
+# CC-123: prompt() — show an interactive prompt on the user's TTY directly.
+#
+# setup_logging() redirects stdout+stderr through a line-buffered pipe so the
+# full run is captured in /var/log/tubss.log. `read -p` writes its prompt to
+# stderr WITHOUT a trailing newline, which the pipe buffers indefinitely —
+# users see nothing and the script looks hung. Writing to /dev/tty bypasses
+# the pipe and restores interactive behavior while preserving logging.
+#
+# Note: IFS is NOT cleared, to match the whitespace-trimming behavior of the
+# plain `read -p` calls that were migrated — free-text prompts (AD domain,
+# custom rule descriptions) should not silently accept leading/trailing spaces.
+#
+# Usage: prompt VARNAME "Prompt text: "
+prompt() {
+    local __varname="$1"
+    local __text="$2"
+    if { : > /dev/tty; } 2>/dev/null; then
+        printf '%s' "$__text" > /dev/tty
+        # shellcheck disable=SC2229
+        read -r "$__varname" < /dev/tty
+    else
+        # Fallback (shouldn't trigger — main() already enforces TTY in
+        # interactive mode — but keeps the helper safe if called from tests).
+        # shellcheck disable=SC2229
+        read -r -p "$__text" "$__varname"
+    fi
+}
+
+# CC-123: prompt_secret() — silent (no-echo) variant of prompt() for passwords.
+# Same /dev/tty-bypass rationale; adds `-s` so the keystrokes are not echoed.
+# Prints a trailing newline after input since `-s` suppresses the user's Enter.
+#
+# Usage: prompt_secret VARNAME "Password: "
+prompt_secret() {
+    local __varname="$1"
+    local __text="$2"
+    if { : > /dev/tty; } 2>/dev/null; then
+        printf '%s' "$__text" > /dev/tty
+        # shellcheck disable=SC2229
+        read -r -s "$__varname" < /dev/tty
+        printf '\n' > /dev/tty
+    else
+        # shellcheck disable=SC2229
+        read -r -s -p "$__text" "$__varname"
+        printf '\n'
+    fi
+}
+
 # P5: detect OS from /etc/os-release and populate distro-specific globals.
 detect_os() {
     # shellcheck disable=SC1091
@@ -657,7 +705,7 @@ run_preflight() {
     if (( TUBSS_UNATTENDED == 1 )); then
         echo "[PREFLIGHT] All checks passed. Continuing (unattended)."
     else
-        read -p "[PREFLIGHT] All checks passed. Press Enter to continue..."
+        prompt REPLY "[PREFLIGHT] All checks passed. Press Enter to continue..."
     fi
     echo ""
 }
@@ -778,7 +826,7 @@ run_prereqs() {
     if (( TUBSS_UNATTENDED == 1 )); then
         echo "[UNATTENDED] Beginning configuration."
     else
-        read -p "Press Enter to begin the configuration..."
+        prompt REPLY "Press Enter to begin the configuration..."
     fi
 }
 
@@ -791,7 +839,7 @@ get_user_configuration() {
         CONFIG_CHOICE="default"
         echo "[UNATTENDED] Using default configuration (skipping default-vs-manual prompt)."
     else
-        read -p "Would you like to use the default configuration or manually configure each option? (default/manual) [default]: " CONFIG_CHOICE
+        prompt CONFIG_CHOICE "Would you like to use the default configuration or manually configure each option? (default/manual) [default]: "
         CONFIG_CHOICE=${CONFIG_CHOICE:-default}
         CONFIG_CHOICE=$(echo "$CONFIG_CHOICE" | tr '[:upper:]' '[:lower:]')
     fi
@@ -810,7 +858,7 @@ get_user_configuration() {
         if [[ "$CONFIG_CHOICE" == "default" ]]; then
             CREATE_SNAPSHOT="yes"
         else
-            read -p "Do you want to create a Timeshift snapshot? (yes/no) [yes]: " CREATE_SNAPSHOT
+            prompt CREATE_SNAPSHOT "Do you want to create a Timeshift snapshot? (yes/no) [yes]: "
             CREATE_SNAPSHOT=${CREATE_SNAPSHOT:-yes}
         fi
     elif command -v zfs &> /dev/null; then
@@ -819,7 +867,7 @@ get_user_configuration() {
             if [[ "$CONFIG_CHOICE" == "default" ]]; then
                 CREATE_SNAPSHOT="yes"
             else
-                read -p "Do you want to create a ZFS snapshot for rollback? (yes/no) [yes]: " CREATE_SNAPSHOT
+                prompt CREATE_SNAPSHOT "Do you want to create a ZFS snapshot for rollback? (yes/no) [yes]: "
                 CREATE_SNAPSHOT=${CREATE_SNAPSHOT:-yes}
             fi
         fi
@@ -831,7 +879,7 @@ get_user_configuration() {
             if [[ "$CONFIG_CHOICE" == "default" ]]; then
                 CREATE_SNAPSHOT="yes"
             else
-                read -p "Do you want to create a Btrfs snapshot for rollback? (yes/no) [yes]: " CREATE_SNAPSHOT
+                prompt CREATE_SNAPSHOT "Do you want to create a Btrfs snapshot for rollback? (yes/no) [yes]: "
                 CREATE_SNAPSHOT=${CREATE_SNAPSHOT:-yes}
             fi
         fi
@@ -844,7 +892,7 @@ get_user_configuration() {
         HOSTNAME="$ORIGINAL_HOSTNAME"
     else
         while true; do
-            read -p "Enter the desired hostname for this machine [$ORIGINAL_HOSTNAME]: " HOSTNAME
+            prompt HOSTNAME "Enter the desired hostname for this machine [$ORIGINAL_HOSTNAME]: "
             HOSTNAME=${HOSTNAME:-$ORIGINAL_HOSTNAME}
             if [[ "$HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,61}[a-zA-Z0-9]$ && ! "$HOSTNAME" =~ ^[0-9.]+$ ]]; then
                 break
@@ -859,7 +907,7 @@ get_user_configuration() {
         NET_TYPE="dhcp"
     else
         while true; do
-            read -p "Do you want to use DHCP or a static IP? (dhcp/static) [dhcp]: " NET_TYPE
+            prompt NET_TYPE "Do you want to use DHCP or a static IP? (dhcp/static) [dhcp]: "
             NET_TYPE=${NET_TYPE:-dhcp}
             NET_TYPE=$(echo "$NET_TYPE" | tr '[:upper:]' '[:lower:]')
             if [[ "$NET_TYPE" == "dhcp" || "$NET_TYPE" == "static" ]]; then
@@ -892,7 +940,7 @@ get_user_configuration() {
                 break
             done
             while true; do
-                read -p "Enter the network interface name (e.g., enp0s3) [$first_interface]: " INTERFACE_NAME
+                prompt INTERFACE_NAME "Enter the network interface name (e.g., enp0s3) [$first_interface]: "
                 INTERFACE_NAME=${INTERFACE_NAME:-$first_interface}
                 if [[ -d "/sys/class/net/$INTERFACE_NAME" ]]; then
                     break
@@ -901,7 +949,7 @@ get_user_configuration() {
                 fi
             done
             while true; do
-                read -p "Enter the static IP address (e.g., ${ORIGINAL_IP}): " STATIC_IP
+                prompt STATIC_IP "Enter the static IP address (e.g., ${ORIGINAL_IP}): "
                 STATIC_IP=${STATIC_IP:-$ORIGINAL_IP}
                 if [[ "$STATIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                     break
@@ -914,7 +962,7 @@ get_user_configuration() {
                 if (( ${ORIGINAL_NETMASK_DETECTED:-1} == 0 )); then
                     _netmask_label="${ORIGINAL_NETMASK_CIDR} (default)"
                 fi
-                read -p "Enter the network mask (CIDR notation, e.g., 24) [${_netmask_label}]: " NETMASK_CIDR
+                prompt NETMASK_CIDR "Enter the network mask (CIDR notation, e.g., 24) [${_netmask_label}]: "
                 NETMASK_CIDR=${NETMASK_CIDR:-$ORIGINAL_NETMASK_CIDR}
                 if [[ "$NETMASK_CIDR" =~ ^(8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32)$ ]]; then
                     break
@@ -923,7 +971,7 @@ get_user_configuration() {
                 fi
             done
             while true; do
-                read -p "Enter the gateway IP address (e.g., $ORIGINAL_GATEWAY) [$ORIGINAL_GATEWAY]: " GATEWAY
+                prompt GATEWAY "Enter the gateway IP address (e.g., $ORIGINAL_GATEWAY) [$ORIGINAL_GATEWAY]: "
                 GATEWAY=${GATEWAY:-$ORIGINAL_GATEWAY}
                 if [[ "$GATEWAY" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                     break
@@ -932,7 +980,7 @@ get_user_configuration() {
                 fi
             done
             while true; do
-                read -p "Enter the DNS server IP address (e.g., $ORIGINAL_DNS) [$ORIGINAL_DNS]: " DNS_SERVER
+                prompt DNS_SERVER "Enter the DNS server IP address (e.g., $ORIGINAL_DNS) [$ORIGINAL_DNS]: "
                 DNS_SERVER=${DNS_SERVER:-$ORIGINAL_DNS}
                 if [[ "$DNS_SERVER" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                     break
@@ -947,7 +995,7 @@ get_user_configuration() {
         echo -e "${YELLOW}You have chosen to configure a static IP address.${NC}"
         echo -e "${YELLOW}Incorrect network settings (IP, Gateway, etc.) can result in a loss of network connectivity, requiring console access to fix.${NC}"
         echo -e "${YELLOW}Please double-check your entries in the summary screen.${NC}"
-        read -p "Press Enter to acknowledge and continue..."
+        prompt REPLY "Press Enter to acknowledge and continue..."
     fi
 
     # Service and Security Prompts
@@ -975,32 +1023,32 @@ get_user_configuration() {
             SSH_HARDENING="no"
         fi
     else
-        read -p "Do you want to install Webmin? (yes/no) [no]: " INSTALL_WEBMIN
+        prompt INSTALL_WEBMIN "Do you want to install Webmin? (yes/no) [no]: "
         INSTALL_WEBMIN=${INSTALL_WEBMIN:-no}
-        read -p "Do you want to enable the UFW firewall? (yes/no) [yes]: " ENABLE_UFW
+        prompt ENABLE_UFW "Do you want to enable the UFW firewall? (yes/no) [yes]: "
         ENABLE_UFW=${ENABLE_UFW:-yes}
-        read -p "Do you want to enable automatic security updates? (yes/no) [yes]: " ENABLE_AUTO_UPDATES
+        prompt ENABLE_AUTO_UPDATES "Do you want to enable automatic security updates? (yes/no) [yes]: "
         ENABLE_AUTO_UPDATES=${ENABLE_AUTO_UPDATES:-yes}
-        read -p "Do you want to install Fail2ban? (yes/no) [yes]: " INSTALL_FAIL2BAN
+        prompt INSTALL_FAIL2BAN "Do you want to install Fail2ban? (yes/no) [yes]: "
         INSTALL_FAIL2BAN=${INSTALL_FAIL2BAN:-yes}
-        read -p "Do you want to disable optional telemetry and analytics? (yes/no) [yes]: " DISABLE_TELEMETRY
+        prompt DISABLE_TELEMETRY "Do you want to disable optional telemetry and analytics? (yes/no) [yes]: "
         DISABLE_TELEMETRY=${DISABLE_TELEMETRY:-yes}
 
         # SSH hardening (CC-104) — opt-in, default N. Only in manual mode.
-        read -p "Enable SSH hardening (sshd_config tightening)? (yes/no) [no]: " SSH_HARDENING
+        prompt SSH_HARDENING "Enable SSH hardening (sshd_config tightening)? (yes/no) [no]: "
         SSH_HARDENING=${SSH_HARDENING:-no}
         SSH_HARDENING=$(echo "$SSH_HARDENING" | tr '[:upper:]' '[:lower:]')
         if [[ "$SSH_HARDENING" =~ ^([yY][eE][sS]|[yY])$ ]]; then
             SSH_HARDENING="yes"
             echo -e "${YELLOW}--- SSH Hardening Options ---${NC}"
             echo -e "${YELLOW}Disabling key-less auth will lock out users without an SSH key.${NC}"
-            read -p "  Disable key-less auth (key-only login)? (yes/no) [yes]: " SSH_DISABLE_PW_AUTH
+            prompt SSH_DISABLE_PW_AUTH "  Disable key-less auth (key-only login)? (yes/no) [yes]: "
             SSH_DISABLE_PW_AUTH=${SSH_DISABLE_PW_AUTH:-yes}
-            read -p "  Disable root login over SSH? (yes/no) [yes]: " SSH_DISABLE_ROOT
+            prompt SSH_DISABLE_ROOT "  Disable root login over SSH? (yes/no) [yes]: "
             SSH_DISABLE_ROOT=${SSH_DISABLE_ROOT:-yes}
-            read -p "  Disable X11 forwarding? (yes/no) [yes]: " SSH_DISABLE_X11
+            prompt SSH_DISABLE_X11 "  Disable X11 forwarding? (yes/no) [yes]: "
             SSH_DISABLE_X11=${SSH_DISABLE_X11:-yes}
-            read -p "  Disable empty credentials? (yes/no) [yes]: " SSH_DISABLE_EMPTY_PW
+            prompt SSH_DISABLE_EMPTY_PW "  Disable empty credentials? (yes/no) [yes]: "
             SSH_DISABLE_EMPTY_PW=${SSH_DISABLE_EMPTY_PW:-yes}
             SSH_DISABLE_PW_AUTH=$(echo "$SSH_DISABLE_PW_AUTH" | tr '[:upper:]' '[:lower:]')
             SSH_DISABLE_ROOT=$(echo "$SSH_DISABLE_ROOT" | tr '[:upper:]' '[:lower:]')
@@ -1012,18 +1060,18 @@ get_user_configuration() {
 
         if [ "$ORIGINAL_DOMAIN_STATUS" != "Not Joined" ]; then
             echo -e "${YELLOW}Your system is currently joined to the domain: ${ORIGINAL_DOMAIN_STATUS}${NC}"
-            read -p "Do you want to leave this domain and join another? (yes/no) [no]: " JOIN_DOMAIN
+            prompt JOIN_DOMAIN "Do you want to leave this domain and join another? (yes/no) [no]: "
             JOIN_DOMAIN=${JOIN_DOMAIN:-no}
         else
-            read -p "Do you want to join an Active Directory domain? (yes/no) [no]: " JOIN_DOMAIN
+            prompt JOIN_DOMAIN "Do you want to join an Active Directory domain? (yes/no) [no]: "
             JOIN_DOMAIN=${JOIN_DOMAIN:-no}
         fi
 
-        read -p "Do you want to install and configure NFS Client? (yes/no) [yes]: " INSTALL_NFS
+        prompt INSTALL_NFS "Do you want to install and configure NFS Client? (yes/no) [yes]: "
         INSTALL_NFS=${INSTALL_NFS:-yes}
-        read -p "Do you want to install and configure SMB Client? (yes/no) [yes]: " INSTALL_SMB
+        prompt INSTALL_SMB "Do you want to install and configure SMB Client? (yes/no) [yes]: "
         INSTALL_SMB=${INSTALL_SMB:-yes}
-        read -p "Do you want to install Git? (yes/no) [yes]: " INSTALL_GIT
+        prompt INSTALL_GIT "Do you want to install Git? (yes/no) [yes]: "
         INSTALL_GIT=${INSTALL_GIT:-yes}
     fi
     # Use tr for flexible input handling
@@ -1046,11 +1094,11 @@ get_user_configuration() {
     if [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         echo ""
         echo -e "${YELLOW}--- Active Directory Details ---${NC}"
-        read -p "Enter the Active Directory domain name (e.g., joka.ca): " AD_DOMAIN
-        read -p "Enter the domain administrator username (e.g., admin.user): " AD_USER
+        prompt AD_DOMAIN "Enter the Active Directory domain name (e.g., joka.ca): "
+        prompt AD_USER "Enter the domain administrator username (e.g., admin.user): "
         echo "Enter the password for the administrator account."
         echo "Note: The password will not be displayed as you type."
-        read -s -p "Password: " AD_PASSWORD
+        prompt_secret AD_PASSWORD "Password: "
     fi
 
     # Custom UFW rules — only in manual mode with UFW enabled
@@ -1073,7 +1121,7 @@ collect_custom_ufw_rules() {
             break
         fi
 
-        read -p "Add a custom firewall rule? (yes/no) [no]: " add_rule
+        prompt add_rule "Add a custom firewall rule? (yes/no) [no]: "
         add_rule=${add_rule:-no}
         add_rule=$(echo "$add_rule" | tr '[:upper:]' '[:lower:]')
 
@@ -1083,7 +1131,7 @@ collect_custom_ufw_rules() {
 
         # Prompt for port (single or range)
         while true; do
-            read -p "  Port or range (e.g., 8080 or 5000-5010): " port
+            prompt port "  Port or range (e.g., 8080 or 5000-5010): "
             if [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]; then
                 break
             else
@@ -1093,7 +1141,7 @@ collect_custom_ufw_rules() {
 
         # Prompt for protocol
         while true; do
-            read -p "  Protocol (tcp/udp/both) [tcp]: " proto
+            prompt proto "  Protocol (tcp/udp/both) [tcp]: "
             proto=${proto:-tcp}
             proto=$(echo "$proto" | tr '[:upper:]' '[:lower:]')
             if [[ "$proto" == "tcp" || "$proto" == "udp" || "$proto" == "both" ]]; then
@@ -1105,7 +1153,7 @@ collect_custom_ufw_rules() {
 
         # Prompt for direction
         while true; do
-            read -p "  Direction (allow/deny) [allow]: " dir
+            prompt dir "  Direction (allow/deny) [allow]: "
             dir=${dir:-allow}
             dir=$(echo "$dir" | tr '[:upper:]' '[:lower:]')
             if [[ "$dir" == "allow" || "$dir" == "deny" ]]; then
@@ -1116,7 +1164,7 @@ collect_custom_ufw_rules() {
         done
 
         # Prompt for description (optional)
-        read -p "  Description (optional, free text): " desc
+        prompt desc "  Description (optional, free text): "
         desc=${desc:-""}
 
         # Store as "port|protocol|direction|description"
@@ -1205,7 +1253,7 @@ show_summary_and_confirm() {
         CONFIRM_EXECUTION="yes"
         echo "[UNATTENDED] Auto-confirming configuration."
     else
-        read -p "Does the above configuration look correct? (yes/no) [yes]: " CONFIRM_EXECUTION
+        prompt CONFIRM_EXECUTION "Does the above configuration look correct? (yes/no) [yes]: "
         CONFIRM_EXECUTION=${CONFIRM_EXECUTION:-yes}
     fi
 
@@ -2322,7 +2370,7 @@ EOF
         return
     fi
 
-    read -p "Configuration is complete. Would you like to reboot the system now? (yes/no) [yes]: " REBOOT_PROMPT
+    prompt REBOOT_PROMPT "Configuration is complete. Would you like to reboot the system now? (yes/no) [yes]: "
     REBOOT_PROMPT=${REBOOT_PROMPT:-yes}
 
     if [[ "$REBOOT_PROMPT" =~ ^([yY][eE][sS]|[yY])$ ]]; then
@@ -2424,7 +2472,7 @@ run_rollback_ui() {
     # Prompt user to select
     local selection
     while true; do
-        read -p "Select a snapshot to restore (1-${#snap_names[@]}, or 0 to cancel): " selection
+        prompt selection "Select a snapshot to restore (1-${#snap_names[@]}, or 0 to cancel): "
         if [[ "$selection" == "0" ]]; then
             echo -e "${YELLOW}Rollback cancelled.${NC}"
             return 0
@@ -2440,7 +2488,7 @@ run_rollback_ui() {
     local chosen_backend="${snap_backends[$(( selection - 1 ))]}"
 
     echo ""
-    read -p "Restore to '${chosen_name}'? This cannot be undone. (yes/no) [no]: " confirm_restore
+    prompt confirm_restore "Restore to '${chosen_name}'? This cannot be undone. (yes/no) [no]: "
     confirm_restore=${confirm_restore:-no}
     confirm_restore=$(echo "$confirm_restore" | tr '[:upper:]' '[:lower:]')
 
@@ -2501,7 +2549,7 @@ run_rollback_ui() {
 
     echo ""
     echo -e "${YELLOW}[INFO]${NC} Reboot is required for the restore to take full effect."
-    read -p "Would you like to reboot now? (yes/no) [no]: " do_reboot
+    prompt do_reboot "Would you like to reboot now? (yes/no) [no]: "
     do_reboot=${do_reboot:-no}
     if [[ "$do_reboot" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
