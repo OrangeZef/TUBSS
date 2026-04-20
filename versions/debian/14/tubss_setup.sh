@@ -82,13 +82,16 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
+# --- Version (must be defined before BANNER_ART, which interpolates it) ---
+TUBSS_SCRIPT_VERSION="2.7.1"
+
 # Define ANSI art for headers
 BANNER_ART="
 +---------------------------------------------+
 |    T U B S S                                |
 +---------------------------------------------+
 |    The Ubuntu/Debian Basic Setup Script     |
-|    Version 2.6                              |
+|    Version ${TUBSS_SCRIPT_VERSION}$(printf '%*s' $((33 - ${#TUBSS_SCRIPT_VERSION})) '')|
 +---------------------------------------------+
 |    Provided by Joka.ca                      |
 +---------------------------------------------+
@@ -185,7 +188,8 @@ ORIGINAL_IP=""
 NETPLAN_APPLY_PENDING=0        # P0: forces reboot if netplan try/apply failed
 
 # --- Run-state persistence ---
-TUBSS_SCRIPT_VERSION="2.7"
+# (TUBSS_SCRIPT_VERSION is defined earlier, before BANNER_ART, so the banner
+# can interpolate it — keep it as the single source of truth.)
 TUBSS_STATE_DIR="/var/lib/tubss"
 TUBSS_STATE_FILE="/var/lib/tubss/last_run"
 CURRENT_STEP=""
@@ -480,22 +484,39 @@ setup_logging() {
     echo "===== TUBSS run started $(date -Is) pid=$$ version=${TUBSS_SCRIPT_VERSION} argv=$* ====="
 }
 
-# CC-123: prompt() — show an interactive prompt on the user's TTY directly.
+# CC-123 / CC-128: prompt() — show an interactive prompt on the user's TTY.
 #
-# setup_logging() redirects stdout+stderr through a line-buffered pipe so the
-# full run is captured in /var/log/tubss.log. `read -p` writes its prompt to
-# stderr WITHOUT a trailing newline, which the pipe buffers indefinitely —
-# users see nothing and the script looks hung. Writing to /dev/tty bypasses
-# the pipe and restores interactive behavior while preserving logging.
+# setup_logging() redirects stdout+stderr through a line-buffered subshell
+# pipe so the full run is captured in /var/log/tubss.log. `read -p` writes
+# its prompt to stderr WITHOUT a trailing newline, which the pipe buffers
+# indefinitely — users see nothing and the script looks hung. Writing to
+# /dev/tty bypasses the pipe and restores interactive behavior.
+#
+# CC-128: /dev/tty writes are unbuffered but the log-pipe subshell is async,
+# so recent stdout lines can arrive AFTER the prompt appears. `_flush_log()`
+# briefly sleeps to let the tee subshell drain its buffer before we paint the
+# prompt, so the user sees log output in the right order.
 #
 # Note: IFS is NOT cleared, to match the whitespace-trimming behavior of the
 # plain `read -p` calls that were migrated — free-text prompts (AD domain,
 # custom rule descriptions) should not silently accept leading/trailing spaces.
 #
 # Usage: prompt VARNAME "Prompt text: "
+
+# Internal: drain pending stdout/stderr through the log pipe. Cheap and safe
+# to call from anywhere; no-op if setup_logging() isn't active.
+_flush_log() {
+    # Emit sentinel newlines then wait a beat for the tee subshell to flush.
+    # 50ms is enough in practice (tee's internal buffer is small) without
+    # being perceptibly slow.
+    printf '' 2>/dev/null
+    sleep 0.05 2>/dev/null || true
+}
+
 prompt() {
     local __varname="$1"
     local __text="$2"
+    _flush_log
     if { : > /dev/tty; } 2>/dev/null; then
         printf '%s' "$__text" > /dev/tty
         # shellcheck disable=SC2229
@@ -508,14 +529,16 @@ prompt() {
     fi
 }
 
-# CC-123: prompt_secret() — silent (no-echo) variant of prompt() for passwords.
-# Same /dev/tty-bypass rationale; adds `-s` so the keystrokes are not echoed.
-# Prints a trailing newline after input since `-s` suppresses the user's Enter.
+# CC-123 / CC-128: prompt_secret() — silent (no-echo) variant for passwords.
+# Same /dev/tty-bypass and flush rationale; adds `-s` so the keystrokes are
+# not echoed. Prints a trailing newline after input since `-s` suppresses
+# the user's Enter.
 #
 # Usage: prompt_secret VARNAME "Password: "
 prompt_secret() {
     local __varname="$1"
     local __text="$2"
+    _flush_log
     if { : > /dev/tty; } 2>/dev/null; then
         printf '%s' "$__text" > /dev/tty
         # shellcheck disable=SC2229
