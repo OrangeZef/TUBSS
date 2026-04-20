@@ -3,125 +3,119 @@ set -euo pipefail
 
 #==============================================================================
 # TUBSS Launcher Script
-# This script downloads and executes the latest version of the TUBSS setup script
-# from the official GitHub repository.
+# Downloads and executes the latest version of the TUBSS setup script from
+# the official GitHub repository.
 #
-# To use:
-# 1. Save this file to your desktop as "tubss_launcher.sh".
-# 2. Make it executable with: chmod +x ~/Desktop/tubss_launcher.sh
-# 3. Run it with: sudo ~/Desktop/tubss_launcher.sh
+# Usage:
+#   sudo ./tubss_launcher.sh [setup-script-flags...]
+#
+# Environment:
+#   TUBSS_REF   — git ref to download from (branch or tag). Default: main.
+#                 Example: TUBSS_REF=v2.7.1 sudo -E ./tubss_launcher.sh
+#
+# Examples:
+#   sudo ./tubss_launcher.sh                       # interactive run
+#   sudo ./tubss_launcher.sh --unattended --dry-run
+#   sudo ./tubss_launcher.sh --rollback
+#   TUBSS_REF=v2.7.0 sudo -E ./tubss_launcher.sh   # pin to a release tag
 #==============================================================================
 
-# Define colors for the terminal
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# --- Function to display an error and exit gracefully ---
-handle_error() {
-    local exit_code=$?
-    echo -e "${RED}--------------------------------------------------------${NC}"
-    echo -e "${RED}An error occurred. The script could not be downloaded or executed.${NC}"
-    echo -e "${RED}Exit Code: ${exit_code}${NC}"
-    echo -e "${RED}--------------------------------------------------------${NC}"
-    exit 1
-}
-
-# --- Set a trap for errors to call our error handler ---
-trap handle_error ERR
-
-# --- Initial check for root privileges ---
+# --- Root check -----------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}This script must be run with root privileges. Please use 'sudo'.${NC}"
-    echo -e "${YELLOW}Example: sudo ./tubss_launcher.sh${NC}"
+    echo -e "${RED}This script must be run with root privileges. Please use 'sudo'.${NC}" >&2
+    echo -e "${YELLOW}Example: sudo ./tubss_launcher.sh${NC}" >&2
     exit 1
 fi
 
-# Detect OS and version early
-VERSION_ID=$(grep VERSION_ID /etc/os-release | cut -d= -f2 | tr -d '"')
-OS_ID=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
+# --- OS detection (sourced from /etc/os-release) --------------------------
+# Shell-native, no grep/cut/tr pipeline. All we need is to validate that
+# this is an OS TUBSS supports; the downloaded setup script does its own
+# full detection.
+if [[ ! -r /etc/os-release ]]; then
+    echo -e "${RED}[ERROR]${NC} /etc/os-release not found — unsupported OS." >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+. /etc/os-release
 
-# Validate supported OS
-if [[ "$OS_ID" != "ubuntu" && "$OS_ID" != "debian" ]]; then
-    echo -e "${RED}[ERROR]${NC} Unsupported OS: ${OS_ID}. TUBSS supports Ubuntu and Debian only."
+if [[ "${ID:-}" != "ubuntu" && "${ID:-}" != "debian" ]]; then
+    echo -e "${RED}[ERROR]${NC} Unsupported OS: ${ID:-unknown}. TUBSS supports Ubuntu and Debian only." >&2
     exit 1
 fi
 
-# Display a friendly welcome message
+# --- Welcome --------------------------------------------------------------
+TUBSS_REF="${TUBSS_REF:-main}"
+
 echo -e "${YELLOW}============================================================${NC}"
 echo -e "${YELLOW}  Welcome to the TUBSS Launcher!${NC}"
-echo -e "${YELLOW}  This script will download the latest version of TUBSS.${NC}"
+echo -e "${YELLOW}  This script will download TUBSS from ref: ${TUBSS_REF}${NC}"
 echo -e "${YELLOW}============================================================${NC}"
 echo ""
-echo -e "${GREEN}[INFO]${NC} Detected OS: ${OS_ID} ${VERSION_ID}"
+echo -e "${GREEN}[INFO]${NC} Detected OS: ${ID} ${VERSION_ID:-unknown}"
 echo ""
 
-# --- Ask for user confirmation before proceeding ---
-read -rp "Proceed? [y/N]: " confirm
-confirm="${confirm,,}"  # lowercase
+# --- Confirmation (reads from /dev/tty for consistency with setup script) -
+if { : > /dev/tty; } 2>/dev/null; then
+    printf "Proceed? [y/N]: " > /dev/tty
+    read -r confirm < /dev/tty
+else
+    # No controlling TTY (CI, piped input) — require explicit opt-in.
+    echo -e "${RED}[ERROR]${NC} No TTY detected. Re-run in an interactive terminal," >&2
+    echo -e "${RED}[ERROR]${NC} or invoke tubss_setup.sh directly with --unattended." >&2
+    exit 2
+fi
+
+confirm="${confirm,,}"
 if [[ "$confirm" != "y" && "$confirm" != "yes" ]]; then
     echo -e "${YELLOW}Aborted.${NC}"
     exit 0
 fi
 
+# --- Download -------------------------------------------------------------
 echo ""
 echo -e "${YELLOW}Starting download...${NC}"
 
-# Always pull the unified root script — it auto-detects OS/version via
-# /etc/os-release. (The versions/ tree is kept as a historical safety net
-# but no longer probed by the launcher.)
-BASE_URL="https://raw.githubusercontent.com/OrangeZef/TUBSS/main"
+BASE_URL="https://raw.githubusercontent.com/OrangeZef/TUBSS/${TUBSS_REF}"
 DOWNLOAD_URL="${BASE_URL}/tubss_setup.sh"
-echo -e "${GREEN}[INFO]${NC} Fetching unified TUBSS setup script (auto-detects ${OS_ID} ${VERSION_ID})"
+CHECKSUM_URL="${BASE_URL}/tubss_setup.sha256"
 
-# Use mktemp for an unpredictable temp filename
-TEMP_SCRIPT=$(mktemp /tmp/tubss_setup.XXXXXX.sh)
+echo -e "${GREEN}[INFO]${NC} Fetching unified TUBSS setup script from ${TUBSS_REF}"
 
-# Register EXIT trap to clean up temp files
-trap 'rm -f "$TEMP_SCRIPT"' EXIT
+TMPDIR_="${TMPDIR:-/tmp}"
+TEMP_SCRIPT="$(mktemp "${TMPDIR_}/tubss_setup.XXXXXX.sh")"
+TEMP_CHECKSUM="$(mktemp "${TMPDIR_}/tubss_checksum.XXXXXX")"
+trap 'rm -f "$TEMP_SCRIPT" "$TEMP_CHECKSUM"' EXIT
 
-# --- Download the script securely using curl ---
-# The -s option makes curl silent.
-# The -f option makes curl fail silently on HTTP errors (e.g., 404).
-# The -S option shows an error message even with -s.
-# The -L option follows redirects.
-# -o specifies the output file.
-if ! curl -fsSL "$DOWNLOAD_URL" -o "$TEMP_SCRIPT"; then
-    echo -e "${RED}Error: Failed to download the TUBSS script from GitHub.${NC}"
+if ! curl -fsSL --proto '=https' --tlsv1.2 "$DOWNLOAD_URL" -o "$TEMP_SCRIPT"; then
+    echo -e "${RED}[ERROR]${NC} Failed to download TUBSS script from ${DOWNLOAD_URL}" >&2
+    echo -e "${RED}[ERROR]${NC} Check network connectivity and that TUBSS_REF='${TUBSS_REF}' exists." >&2
     exit 1
 fi
-
 echo -e "${GREEN}[OK]${NC} Download successful."
 
-# --- Download SHA256 checksum and verify if available ---
-CHECKSUM_URL="${DOWNLOAD_URL%.sh}.sha256"
-TEMP_CHECKSUM=$(mktemp /tmp/tubss_checksum.XXXXXX)
-
-curl --silent --fail "$CHECKSUM_URL" -o "$TEMP_CHECKSUM" 2>/dev/null || true
-if [[ ! -s "$TEMP_CHECKSUM" ]]; then
-    echo -e "${RED}[ERROR] SHA256 checksum file not found at remote. Cannot verify integrity. Aborting.${NC}"
-    rm -f "$TEMP_SCRIPT" "$TEMP_CHECKSUM"
+# --- Integrity check ------------------------------------------------------
+if ! curl -fsSL --proto '=https' --tlsv1.2 "$CHECKSUM_URL" -o "$TEMP_CHECKSUM"; then
+    echo -e "${RED}[ERROR]${NC} SHA256 checksum file missing at ${CHECKSUM_URL}" >&2
+    echo -e "${RED}[ERROR]${NC} Cannot verify integrity — aborting." >&2
     exit 1
 fi
+
 echo -e "${GREEN}[INFO]${NC} Verifying script integrity..."
-EXPECTED_HASH=$(awk '{print $1}' "$TEMP_CHECKSUM")
-ACTUAL_HASH=$(sha256sum "$TEMP_SCRIPT" | awk '{print $1}')
-if [[ "$EXPECTED_HASH" == "$ACTUAL_HASH" ]]; then
-    echo -e "${GREEN}[OK]${NC} Integrity check passed"
-else
-    echo -e "${RED}[ERROR]${NC} Integrity check FAILED — aborting for security"
-    rm -f "$TEMP_SCRIPT" "$TEMP_CHECKSUM"
+EXPECTED_HASH="$(awk '{print $1}' "$TEMP_CHECKSUM")"
+ACTUAL_HASH="$(sha256sum "$TEMP_SCRIPT" | awk '{print $1}')"
+
+if [[ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]]; then
+    echo -e "${RED}[ERROR]${NC} Integrity check FAILED — expected ${EXPECTED_HASH}, got ${ACTUAL_HASH}" >&2
+    echo -e "${RED}[ERROR]${NC} Aborting for security." >&2
     exit 1
 fi
-rm -f "$TEMP_CHECKSUM"
+echo -e "${GREEN}[OK]${NC} Integrity check passed."
 
-# --- Run the downloaded script with the current shell ---
+# --- Execute --------------------------------------------------------------
 echo -e "${YELLOW}Executing the TUBSS setup script now...${NC}"
-
-if [[ "${1:-}" == "--rollback" ]]; then
-    bash "$TEMP_SCRIPT" --rollback
-else
-    bash "$TEMP_SCRIPT"
-fi
-exit $?
+bash "$TEMP_SCRIPT" "$@"
