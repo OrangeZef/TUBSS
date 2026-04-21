@@ -83,7 +83,7 @@ GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
 # --- Version (must be defined before BANNER_ART, which interpolates it) ---
-TUBSS_SCRIPT_VERSION="2.7.1"
+TUBSS_SCRIPT_VERSION="2.8.0"
 
 # Define ANSI art for headers
 BANNER_ART="
@@ -1225,6 +1225,7 @@ display_config_summary() {
         printf "%-30b | %-20s | %-20s\n" "${YELLOW}Custom UFW Rules:${NC}" "none" "none"
     fi
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Auto Updates Status:${NC}" "${ORIGINAL_AUTO_UPDATES_STATUS}" "${NEW_AUTO_UPDATES_SUMMARY}"
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Package Updates:${NC}" "pending" "To be Applied"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Fail2ban Status:${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "${NEW_FAIL2BAN_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}SSH Hardening:${NC}" "default" "${NEW_SSH_HARDENING_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "${NEW_TELEMETRY_SUMMARY}"
@@ -1539,6 +1540,25 @@ install_packages() {
         wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Updating package lists failed (exit $?)"; exit 1; }
     fi
     echo -e "${GREEN}[OK]${NC} Package lists updated."
+
+    # CC-131: apply pending package upgrades BEFORE installing new packages.
+    # Always-on — matches the always-on `apt-get update` behavior. Uses
+    # `apt-get upgrade` (not dist-upgrade) to avoid silent metapackage
+    # removals or kernel-metapackage shuffles on mixed-release boxes.
+    # NEEDRESTART_MODE=a + DEBIAN_FRONTEND=noninteractive silence the
+    # needrestart interactive prompt and any maintainer-script prompts
+    # (CC-103 pattern — without this, apt upgrade hangs on 24.04).
+    echo -ne "${YELLOW}[TUBSS] Applying pending package updates...${NC}"
+    if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
+        echo ""
+        echo "[DRY-RUN] apt-get upgrade -y"
+    else
+        NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get upgrade -y > /dev/null 2>&1 &
+        bg_pid=$!
+        spinner $bg_pid "Applying pending package updates"
+        wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Applying package updates failed (exit $?)"; exit 1; }
+    fi
+    echo -e "${GREEN}[OK]${NC} Package updates applied."
 
     # Distro-aware base package set (P5).
     # - Ubuntu + Debian 12 use neofetch; Debian 13/14 use fastfetch.
@@ -2348,6 +2368,7 @@ Webmin Status                | $ORIGINAL_WEBMIN_STATUS    | ${NEW_WEBMIN_SUMMARY
 UFW Status                   | $ORIGINAL_UFW_STATUS       | ${NEW_UFW_SUMMARY}
 Custom UFW Rules             | none                       | ${#CUSTOM_UFW_RULES[@]} rule(s)
 Auto Updates Status          | $ORIGINAL_AUTO_UPDATES_STATUS | ${NEW_AUTO_UPDATES_SUMMARY}
+Package Updates              | pending                    | Applied
 Fail2ban Status              | $ORIGINAL_FAIL2BAN_STATUS  | ${NEW_FAIL2BAN_SUMMARY}
 SSH Hardening                | default                    | ${NEW_SSH_HARDENING_SUMMARY}
 Telemetry/Analytics          | $ORIGINAL_TELEMETRY_STATUS | ${NEW_TELEMETRY_SUMMARY}

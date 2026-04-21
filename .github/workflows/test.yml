@@ -48,6 +48,8 @@ jobs:
           echo "$out" | grep -q '\[DRY-RUN\]' || { echo "::error::No [DRY-RUN] markers found"; exit 1; }
           # Core subsystems ran
           echo "$out" | grep -qE '(Installing packages|Package lists updated)' || { echo "::error::Package install step missing"; exit 1; }
+          # CC-131: apt upgrade step present
+          echo "$out" | grep -qE 'Applying pending package updates' || { echo "::error::apt upgrade step missing (CC-131)"; exit 1; }
           echo "$out" | grep -q 'Configuring UFW' || { echo "::error::UFW step missing"; exit 1; }
           echo "$out" | grep -q 'Configuring Fail2ban' || { echo "::error::Fail2ban step missing"; exit 1; }
           # SSH hardening default is OFF — must appear as skipped/disabled
