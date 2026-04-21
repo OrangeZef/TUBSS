@@ -83,7 +83,7 @@ GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
 # --- Version (must be defined before BANNER_ART, which interpolates it) ---
-TUBSS_SCRIPT_VERSION="2.8.1"
+TUBSS_SCRIPT_VERSION="2.8.2"
 
 # Define ANSI art for headers
 BANNER_ART="
@@ -131,6 +131,10 @@ NEW_IP_ADDRESS_SUMMARY=""
 NEW_GATEWAY_SUMMARY=""
 NEW_DNS_SUMMARY=""
 NEW_SSH_HARDENING_SUMMARY=""
+# CC-133: set to "Applied", "Partial (upgrade failed, continuing)", or
+# left at "pending" if we never reached the upgrade step (dry-run exits
+# before install_packages in some paths, or a fatal earlier error).
+PACKAGE_UPDATES_STATUS="pending"
 
 # --- SSH hardening toggles (CC-104) ---
 # Feature is OFF by default. When SSH_HARDENING="yes", the individual
@@ -469,7 +473,7 @@ setup_logging() {
     echo "===== TUBSS run started $(date -Is) pid=$$ version=${TUBSS_SCRIPT_VERSION} argv=$* ====="
 }
 
-# CC-123 / CC-128: prompt() — show an interactive prompt on the user's TTY.
+# CC-123 / CC-128 / CC-133: prompt() — show an interactive prompt on the user's TTY.
 #
 # setup_logging() redirects stdout+stderr through a line-buffered subshell
 # pipe so the full run is captured in /var/log/tubss.log. `read -p` writes
@@ -480,7 +484,16 @@ setup_logging() {
 # CC-128: /dev/tty writes are unbuffered but the log-pipe subshell is async,
 # so recent stdout lines can arrive AFTER the prompt appears. `_flush_log()`
 # briefly sleeps to let the tee subshell drain its buffer before we paint the
-# prompt, so the user sees log output in the right order.
+# prompt. Note: this is a BEST-EFFORT ordering aid (cosmetic) — there's no
+# guaranteed drain; on a loaded VM with heavy prior output, a stray log line
+# may still land after the prompt. The operator's choices remain captured
+# via the summary table, which is the canonical audit record.
+#
+# CC-133 audit note: prompt *text* is NOT captured in /var/log/tubss.log
+# because /dev/tty bypasses the log pipe entirely. This is intentional —
+# the summary table at end-of-run is the source of truth for what the
+# operator chose. If you need a fuller audit trail, log the chosen values
+# explicitly after each prompt.
 #
 # Note: IFS is NOT cleared, to match the whitespace-trimming behavior of the
 # plain `read -p` calls that were migrated — free-text prompts (AD domain,
@@ -488,33 +501,47 @@ setup_logging() {
 #
 # Usage: prompt VARNAME "Prompt text: "
 
-# Internal: drain pending stdout/stderr through the log pipe. Cheap and safe
-# to call from anywhere; no-op if setup_logging() isn't active.
+# Internal: give the async tee subshell a moment to flush pending output
+# before the next prompt is painted on /dev/tty. BEST-EFFORT — not a
+# guaranteed drain. See prompt()'s header comment.
 _flush_log() {
-    # Emit sentinel newlines then wait a beat for the tee subshell to flush.
-    # 50ms is enough in practice (tee's internal buffer is small) without
-    # being perceptibly slow.
-    printf '' 2>/dev/null
     sleep 0.05 2>/dev/null || true
+}
+
+# Internal: guard against callers passing a `__`-prefixed varname that
+# would collide with the helper's internal locals (`__varname`, `__text`).
+# All existing callers use unprefixed names; this protects future callers.
+_prompt_validate_varname() {
+    local name="$1"
+    if [[ "$name" =~ ^__ ]]; then
+        echo "[BUG] prompt(): reserved varname '$name' (double-underscore prefix)." >&2
+        return 2
+    fi
+    return 0
 }
 
 prompt() {
     local __varname="$1"
     local __text="$2"
+    _prompt_validate_varname "$__varname" || return 2
     _flush_log
     if { : > /dev/tty; } 2>/dev/null; then
         printf '%s' "$__text" > /dev/tty
         # shellcheck disable=SC2229
         read -r "$__varname" < /dev/tty
     else
-        # Fallback (shouldn't trigger — main() already enforces TTY in
-        # interactive mode — but keeps the helper safe if called from tests).
-        # shellcheck disable=SC2229
-        read -r -p "$__text" "$__varname"
+        # No /dev/tty available. Under setup_logging() the fallback would
+        # have the SAME bug as raw `read -p` (prompt stuck in tee buffer
+        # forever). Refuse rather than silently hang. main() already
+        # enforces stdin-TTY in interactive mode, so this should never
+        # fire in production — it's defensive only.
+        echo "[FATAL] prompt(): /dev/tty is not writable — cannot prompt interactively." >&2
+        echo "[FATAL] Run with --unattended (skips prompts) or from a real terminal." >&2
+        exit 3
     fi
 }
 
-# CC-123 / CC-128: prompt_secret() — silent (no-echo) variant for passwords.
+# CC-123 / CC-128 / CC-133: prompt_secret() — silent (no-echo) variant for passwords.
 # Same /dev/tty-bypass and flush rationale; adds `-s` so the keystrokes are
 # not echoed. Prints a trailing newline after input since `-s` suppresses
 # the user's Enter.
@@ -523,6 +550,7 @@ prompt() {
 prompt_secret() {
     local __varname="$1"
     local __text="$2"
+    _prompt_validate_varname "$__varname" || return 2
     _flush_log
     if { : > /dev/tty; } 2>/dev/null; then
         printf '%s' "$__text" > /dev/tty
@@ -530,9 +558,9 @@ prompt_secret() {
         read -r -s "$__varname" < /dev/tty
         printf '\n' > /dev/tty
     else
-        # shellcheck disable=SC2229
-        read -r -s -p "$__text" "$__varname"
-        printf '\n'
+        echo "[FATAL] prompt_secret(): /dev/tty is not writable — cannot prompt interactively." >&2
+        echo "[FATAL] Run with --unattended or from a real terminal." >&2
+        exit 3
     fi
 }
 
@@ -1210,7 +1238,17 @@ display_config_summary() {
         printf "%-30b | %-20s | %-20s\n" "${YELLOW}Custom UFW Rules:${NC}" "none" "none"
     fi
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Auto Updates Status:${NC}" "${ORIGINAL_AUTO_UPDATES_STATUS}" "${NEW_AUTO_UPDATES_SUMMARY}"
-    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Package Updates:${NC}" "pending" "To be Applied"
+    # CC-133: "Package Updates" row — show "pending" pre-execution; updated
+    # to "Applied" or "Partial (upgrade failed, continuing)" post-upgrade.
+    # This table is shown both before execution (configuration review) and
+    # after (final summary), so PACKAGE_UPDATES_STATUS tracks both states.
+    local _pkg_before _pkg_after
+    if [[ "$PACKAGE_UPDATES_STATUS" == "pending" ]]; then
+        _pkg_before="pending"; _pkg_after="To be Applied"
+    else
+        _pkg_before="pending"; _pkg_after="$PACKAGE_UPDATES_STATUS"
+    fi
+    printf "%-30b | %-20s | %-20s\n" "${YELLOW}Package Updates:${NC}" "${_pkg_before}" "${_pkg_after}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Fail2ban Status:${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "${NEW_FAIL2BAN_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}SSH Hardening:${NC}" "default" "${NEW_SSH_HARDENING_SUMMARY}"
     printf "%-30b | %-20s | %-20s\n" "${YELLOW}Telemetry/Analytics:${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "${NEW_TELEMETRY_SUMMARY}"
@@ -1526,24 +1564,48 @@ install_packages() {
     fi
     echo -e "${GREEN}[OK]${NC} Package lists updated."
 
-    # CC-131: apply pending package upgrades BEFORE installing new packages.
+    # CC-131 / CC-133: apply pending package upgrades BEFORE installing new packages.
     # Always-on — matches the always-on `apt-get update` behavior. Uses
     # `apt-get upgrade` (not dist-upgrade) to avoid silent metapackage
     # removals or kernel-metapackage shuffles on mixed-release boxes.
-    # NEEDRESTART_MODE=a + DEBIAN_FRONTEND=noninteractive silence the
-    # needrestart interactive prompt and any maintainer-script prompts
-    # (CC-103 pattern — without this, apt upgrade hangs on 24.04).
+    #
+    # Guards:
+    #   NEEDRESTART_MODE=a           — silences needrestart (24.04 hang fix)
+    #   DEBIAN_FRONTEND=noninteractive — suppresses maintainer-script prompts
+    #   -o Dpkg::Options --force-confdef --force-confold — explicitly keep
+    #     existing conffiles on upgrade. Without this, the behavior depends
+    #     on apt defaults (usually "keep old" but implicit). Making it
+    #     explicit means a TUBSS re-run never silently overwrites a conffile
+    #     the operator hand-edited (e.g. /etc/ssh/sshd_config).
+    #
+    # CC-133: failure is WARN-AND-CONTINUE (not fatal). Rationale: a
+    # hardened box running outdated packages is still more secure than an
+    # un-hardened box, so we prefer to finish UFW/fail2ban/SSH hardening
+    # even if the upgrade step itself stumbles. Set PACKAGE_UPDATES_STATUS
+    # so the final summary reflects reality.
+    PACKAGE_UPDATES_STATUS="Applied"
     echo -ne "${YELLOW}[TUBSS] Applying pending package updates...${NC}"
     if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
         echo ""
-        echo "[DRY-RUN] apt-get upgrade -y"
+        echo "[DRY-RUN] apt-get upgrade -y (--force-confdef --force-confold)"
+        echo -e "${GREEN}[OK]${NC} Package updates applied."
     else
-        NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get upgrade -y > /dev/null 2>&1 &
+        NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive \
+            apt-get -y \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confold" \
+            upgrade > /dev/null 2>&1 &
         bg_pid=$!
         spinner $bg_pid "Applying pending package updates"
-        wait $bg_pid || { echo -e "\n${RED}[ERROR]${NC} Applying package updates failed (exit $?)"; exit 1; }
+        if wait $bg_pid; then
+            echo -e "${GREEN}[OK]${NC} Package updates applied."
+        else
+            local _rc=$?
+            PACKAGE_UPDATES_STATUS="Partial (upgrade failed, continuing)"
+            echo -e "\n${YELLOW}[WARN]${NC} Package updates failed (exit ${_rc}) — continuing with TUBSS hardening."
+            echo -e "${YELLOW}[WARN]${NC} Investigate with: sudo apt-get upgrade (rerun interactively)."
+        fi
     fi
-    echo -e "${GREEN}[OK]${NC} Package updates applied."
 
     # Distro-aware base package set (P5).
     # - Ubuntu + Debian 12 use neofetch; Debian 13/14 use fastfetch.
@@ -2353,7 +2415,7 @@ Webmin Status                | $ORIGINAL_WEBMIN_STATUS    | ${NEW_WEBMIN_SUMMARY
 UFW Status                   | $ORIGINAL_UFW_STATUS       | ${NEW_UFW_SUMMARY}
 Custom UFW Rules             | none                       | ${#CUSTOM_UFW_RULES[@]} rule(s)
 Auto Updates Status          | $ORIGINAL_AUTO_UPDATES_STATUS | ${NEW_AUTO_UPDATES_SUMMARY}
-Package Updates              | pending                    | Applied
+Package Updates              | pending                    | ${PACKAGE_UPDATES_STATUS}
 Fail2ban Status              | $ORIGINAL_FAIL2BAN_STATUS  | ${NEW_FAIL2BAN_SUMMARY}
 SSH Hardening                | default                    | ${NEW_SSH_HARDENING_SUMMARY}
 Telemetry/Analytics          | $ORIGINAL_TELEMETRY_STATUS | ${NEW_TELEMETRY_SUMMARY}
