@@ -83,7 +83,7 @@ GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
 # --- Version (must be defined before BANNER_ART, which interpolates it) ---
-TUBSS_SCRIPT_VERSION="2.8.0"
+TUBSS_SCRIPT_VERSION="2.8.1"
 
 # Define ANSI art for headers
 BANNER_ART="
@@ -115,21 +115,6 @@ CLOSING_ART="
  __________________________________________________________________
 < Thank you for using TUBSS - The Ubuntu/Debian Basic Setup Script! >
  ------------------------------------------------------------------
-          \
-           \    .--.
-            \  ( o  o)
-             >  )  (
-           /    '--'
-          (____)__
-            /  /
-           /  /
-         /  /
-       /\\_//\\
-      (oo) (oo)
-      / |  | \\
-     |  |  |  |
-     \\_/_ \\_/_/
-        \_/
 "
 
 # --- Global Summary Variables (for DRY principle) ---
