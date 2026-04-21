@@ -52,6 +52,9 @@ assert_pkg_installed unattended-upgrades
 assert_service_enabled fail2ban
 assert_file_exists /var/log/tubss.log
 assert_file_contains /var/log/tubss.log 'run ended rc=0'
+# CC-131: apt upgrade step must have executed (not just update)
+assert_file_contains /var/log/tubss.log 'Applying pending package updates'
+assert_file_contains /var/log/tubss.log 'Package updates applied'
 assert_file_exists /var/lib/tubss/last_run
 assert_file_contains /var/lib/tubss/last_run 'STATUS=completed'
 # cloud-init drop-in is only written when /etc/cloud/cloud.cfg.d/ exists
