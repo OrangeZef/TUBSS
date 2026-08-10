@@ -80,8 +80,11 @@ run_debian_test() {
     passed=$((passed + 1))
 }
 
+run_test "26.04" "$SCRIPT_DIR/Dockerfile.2604"
 run_test "24.04" "$SCRIPT_DIR/Dockerfile"
 run_test "22.04" "$SCRIPT_DIR/Dockerfile.2204"
+run_test "20.04" "$SCRIPT_DIR/Dockerfile.2004"
+run_debian_test "11" "$SCRIPT_DIR/Dockerfile.debian11"
 run_debian_test "12" "$SCRIPT_DIR/Dockerfile.debian12"
 run_debian_test "13" "$SCRIPT_DIR/Dockerfile.debian13"
 run_debian_test "14" "$SCRIPT_DIR/Dockerfile.debian14"

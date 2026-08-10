@@ -13,12 +13,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: ubuntu-26.04
+            dockerfile: test/Dockerfile.2604
+            script_path: /usr/local/bin/tubss_setup.sh
           - name: ubuntu-24.04
             dockerfile: test/Dockerfile
             script_path: /usr/local/bin/tubss_setup.sh
           - name: ubuntu-22.04
             dockerfile: test/Dockerfile.2204
             script_path: /usr/local/bin/tubss_setup.sh
+          - name: ubuntu-20.04
+            dockerfile: test/Dockerfile.2004
+            script_path: /usr/local/bin/tubss_setup.sh
+          - name: debian-11
+            dockerfile: test/Dockerfile.debian11
+            script_path: /root/tubss_setup.sh
           - name: debian-12
             dockerfile: test/Dockerfile.debian12
             script_path: /root/tubss_setup.sh
@@ -56,3 +65,46 @@ jobs:
           echo "$out" | grep -qE '(SSH hardening disabled|SKIP\].*SSH)' || { echo "::error::SSH hardening block missing"; exit 1; }
           # Clean exit marker
           echo "$out" | grep -qE 'TUBSS run ended rc=0' || { echo "::error::Missing clean-exit log marker"; exit 1; }
+      - name: AD domain-join dry-run smoke (unattended, pre-seeded via env)
+        run: |
+          # Fake, non-functional value used only to satisfy the script's
+          # non-empty-credential check in a dry run -- never a real secret,
+          # never used against a real domain controller.
+          out=$(docker run --rm \
+            -e TUBSS_UNATTENDED=1 -e TUBSS_DRY_RUN=1 -e JOIN_DOMAIN=yes \
+            -e AD_DOMAIN=corp.example.com -e AD_USER=svc.join -e AD_PASSWORD=not-a-real-credential \
+            -e AD_PERMIT_MODE=group -e AD_PERMIT_GROUP="IT Admins" -e AD_SUDO_EXTRA_USER=jsmith \
+            tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --unattended --dry-run 2>&1)
+          echo "$out"
+          # This is the exact path that was completely broken until this
+          # review round: a top-of-file unconditional reset was silently
+          # wiping pre-seeded AD_PERMIT_MODE/AD_PERMIT_GROUP/AD_SUDO_EXTRA_USER
+          # before they could ever be read. Assert the real, non-default
+          # values actually flow through end to end.
+          echo "$out" | grep -q 'realm discover corp.example.com' || { echo "::error::AD discover step missing"; exit 1; }
+          echo "$out" | grep -q 'realm join --user=svc.join corp.example.com' || { echo "::error::AD join step missing"; exit 1; }
+          echo "$out" | grep -q 'realm permit -g "IT Admins"' || { echo "::error::AD permit-group step missing or env value not honored"; exit 1; }
+          echo "$out" | grep -qE 'TUBSS run ended rc=0' || { echo "::error::Missing clean-exit log marker"; exit 1; }
+      - name: AD sudoers-injection regression guard
+        run: |
+          # AD_SUDO_EXTRA_USER=ALL is a real privilege-escalation regression
+          # test: "ALL" is a sudoers reserved keyword meaning "every user",
+          # passes a plain character allowlist untouched, and was confirmed
+          # exploitable against real visudo before _is_safe_sudo_username was
+          # added. This must always be rejected -- if it ever isn't, CI fails.
+          out=$(docker run --rm \
+            -e TUBSS_UNATTENDED=1 -e TUBSS_DRY_RUN=1 -e JOIN_DOMAIN=yes \
+            -e AD_DOMAIN=corp.example.com -e AD_USER=svc.join -e AD_PASSWORD=not-a-real-credential \
+            -e AD_SUDO_EXTRA_USER='ALL' \
+            tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --unattended --dry-run 2>&1)
+          echo "$out"
+          echo "$out" | grep -qE "reserved word 'ALL'" || { echo "::error::AD_SUDO_EXTRA_USER=ALL was NOT rejected — sudoers privilege-escalation regression"; exit 1; }
+          echo "$out" | grep -q 'ALL ALL=(ALL:ALL) ALL' && { echo "::error::Escalation payload reached sudoers install path"; exit 1; }
+          # Same class of bug via the sudoers comment character.
+          out2=$(docker run --rm \
+            -e TUBSS_UNATTENDED=1 -e TUBSS_DRY_RUN=1 -e JOIN_DOMAIN=yes \
+            -e AD_DOMAIN=corp.example.com -e AD_USER=svc.join -e AD_PASSWORD=not-a-real-credential \
+            -e AD_SUDO_EXTRA_USER='attacker ALL=(ALL) NOPASSWD:ALL #' \
+            tubss-${{ matrix.name }} bash ${{ matrix.script_path }} --unattended --dry-run 2>&1)
+          echo "$out2"
+          echo "$out2" | grep -q 'unsafe characters' || { echo "::error::'#'-comment sudoers injection payload was NOT rejected"; exit 1; }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Integration test harness. Runs inside a systemd-enabled container.
-# Usage: run.sh [default|ssh-hardened]
+# Usage: run.sh [default|ssh-hardened|ssh-hardening-broken]
 set -euo pipefail
 
 MODE=${1:-default}
@@ -18,7 +18,7 @@ echo "=========================================="
 export TUBSS_UNATTENDED=1
 export TUBSS_SKIP_REBOOT=1
 
-if [[ "$MODE" == "ssh-hardened" ]]; then
+if [[ "$MODE" == "ssh-hardened" || "$MODE" == "ssh-hardening-broken" ]]; then
     # Flip SSH hardening on via env — script respects SSH_HARDENING=yes
     # when pre-seeded in the environment (documented opt-in for tests/automation).
     export SSH_HARDENING=yes
@@ -26,6 +26,18 @@ if [[ "$MODE" == "ssh-hardened" ]]; then
     export SSH_DISABLE_ROOT=yes
     export SSH_DISABLE_X11=yes
     export SSH_DISABLE_EMPTY_PW=yes
+fi
+
+if [[ "$MODE" == "ssh-hardening-broken" ]]; then
+    # CC-181 regression: force `sshd -t` to fail regardless of what TUBSS
+    # itself writes, by pre-seeding an unrecognized directive into the main
+    # sshd_config that TUBSS's own hardening settings can never satisfy.
+    # `sshd -t -f sshd_config` validates the merged config (main file plus
+    # any Include'd drop-ins), so this fails validation no matter what the
+    # drop-in contains. Before this fix, a validation failure here used
+    # `return 1` from a bare, unguarded call site — under `set -e` that
+    # aborted the entire run before auto-updates/MOTD/telemetry/AD ever ran.
+    echo "TubssBogusDirectiveForCI981 yes" >> /etc/ssh/sshd_config
 fi
 
 # Execute
@@ -66,13 +78,34 @@ fi
 
 if [[ "$MODE" == "default" ]]; then
     # SSH hardening default is OFF — drop-in must NOT exist
-    assert_file_absent /etc/ssh/sshd_config.d/99-tubss-hardening.conf
+    assert_file_absent /etc/ssh/sshd_config.d/00-tubss-hardening.conf
 elif [[ "$MODE" == "ssh-hardened" ]]; then
     # SSH hardening drop-in should exist
-    assert_file_exists /etc/ssh/sshd_config.d/99-tubss-hardening.conf
-    assert_file_contains /etc/ssh/sshd_config.d/99-tubss-hardening.conf 'PermitRootLogin no'
-    assert_file_contains /etc/ssh/sshd_config.d/99-tubss-hardening.conf 'X11Forwarding no'
-    assert_file_contains /etc/ssh/sshd_config.d/99-tubss-hardening.conf 'PermitEmptyPasswords no'
+    assert_file_exists /etc/ssh/sshd_config.d/00-tubss-hardening.conf
+    assert_file_contains /etc/ssh/sshd_config.d/00-tubss-hardening.conf 'PermitRootLogin no'
+    assert_file_contains /etc/ssh/sshd_config.d/00-tubss-hardening.conf 'X11Forwarding no'
+    assert_file_contains /etc/ssh/sshd_config.d/00-tubss-hardening.conf 'PermitEmptyPasswords no'
+elif [[ "$MODE" == "ssh-hardening-broken" ]]; then
+    # CC-181: the whole point of this mode is that the run reaches this line
+    # at all. If the old `return 1`-from-a-bare-call-site bug ever comes
+    # back, `bash /root/tubss_setup.sh --unattended` above exits non-zero
+    # under `set -e` and the harness already exited 1 before reaching here.
+    assert_file_contains /var/log/tubss.log 'sshd -t validation failed'
+    assert_file_contains /var/log/tubss.log 'SSH Hardening: Failed \(sshd -t validation'
+    # This run uses the SAME settings as the preceding "ssh-hardened" run,
+    # so the drop-in already matches desired state and TUBSS takes the
+    # [SKIP] branch — it never rewrites the drop-in this run. The bogus
+    # directive is unrelated to TUBSS's own content, so the fix under
+    # review (this run didn't write it -> don't delete it) means the
+    # already-valid, previously-applied drop-in from the prior run MUST
+    # survive. Deleting a known-good drop-in over an unrelated sshd_config
+    # problem would silently un-harden SSH on the next reload/reboot for
+    # no reason connected to what TUBSS actually did.
+    assert_file_exists /etc/ssh/sshd_config.d/00-tubss-hardening.conf
+    assert_file_contains /etc/ssh/sshd_config.d/00-tubss-hardening.conf 'PermitRootLogin no'
+    # Steps AFTER ssh_hardening in the pipeline must still have executed —
+    # this is the actual regression: proof the run didn't abort mid-pipeline.
+    assert_file_contains /var/log/tubss.log 'Enabling Automatic Security Updates'
 fi
 
 summary

@@ -15,10 +15,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: ubuntu-26.04
+            dockerfile: test/integration/Dockerfile.ubuntu-26.04
           - name: ubuntu-24.04
             dockerfile: test/integration/Dockerfile.ubuntu-24.04
           - name: ubuntu-22.04
             dockerfile: test/integration/Dockerfile.ubuntu-22.04
+          - name: ubuntu-20.04
+            dockerfile: test/integration/Dockerfile.ubuntu-20.04
+          - name: debian-11
+            dockerfile: test/integration/Dockerfile.debian-11
           - name: debian-12
             dockerfile: test/integration/Dockerfile.debian-12
           - name: debian-13
@@ -48,6 +54,16 @@ jobs:
         run: docker exec tubss-${{ matrix.name }} bash -c "rm -f /var/log/tubss.log /var/lib/tubss/last_run"
       - name: Run TUBSS (SSH hardening enabled)
         run: docker exec tubss-${{ matrix.name }} /root/run.sh ssh-hardened
+      - name: Capture SSH-hardened run log
+        if: always()
+        run: docker exec tubss-${{ matrix.name }} cat /var/log/tubss.log || true
+      - name: Clean container state for third run
+        run: docker exec tubss-${{ matrix.name }} bash -c "rm -f /var/log/tubss.log /var/lib/tubss/last_run"
+      - name: Run TUBSS (CC-181 regression — sshd -t validation failure must not abort the run)
+        run: docker exec tubss-${{ matrix.name }} /root/run.sh ssh-hardening-broken
+      - name: Capture CC-181 regression run log
+        if: always()
+        run: docker exec tubss-${{ matrix.name }} cat /var/log/tubss.log || true
       - name: Cleanup
         if: always()
         run: docker rm -f tubss-${{ matrix.name }} || true
