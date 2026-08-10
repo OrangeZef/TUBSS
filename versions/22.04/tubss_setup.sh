@@ -2617,6 +2617,20 @@ configure_ufw() {
             echo "[DRY-RUN] ufw allow ssh"
             echo "[DRY-RUN] ufw --force enable"
         else
+            # Some kernels (minimal cloud/container images, certain
+            # hardened or nftables-only builds) have the ip6tables binary
+            # present but its "filter" table unreachable. Every ufw
+            # command that touches the v6 ruleset then exits non-zero, and
+            # since these are plain unguarded calls, that used to abort
+            # the ENTIRE TUBSS run right here under `set -e` — before UFW
+            # itself finished, let alone fail2ban/SSH hardening/AD/
+            # anything else. Probe for it and tell ufw to manage IPv4
+            # only rather than let an IPv6-only firewall backend problem
+            # take down the whole run.
+            if [[ -f /etc/default/ufw ]] && ! ip6tables -L >/dev/null 2>&1; then
+                sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw
+                echo -e "  ${YELLOW}[WARN]${NC} ip6tables unusable on this kernel — UFW will manage IPv4 only."
+            fi
             ufw default deny incoming
             ufw default allow outgoing
             ufw allow ssh
