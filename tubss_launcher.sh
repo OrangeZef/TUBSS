@@ -11,13 +11,13 @@ set -euo pipefail
 #
 # Environment:
 #   TUBSS_REF   — git ref to download from (branch or tag). Default: main.
-#                 Example: TUBSS_REF=v2.7.1 sudo -E ./tubss_launcher.sh
+#                 Example: TUBSS_REF=v2.8.2 sudo -E ./tubss_launcher.sh
 #
 # Examples:
 #   sudo ./tubss_launcher.sh                       # interactive run
 #   sudo ./tubss_launcher.sh --unattended --dry-run
 #   sudo ./tubss_launcher.sh --rollback
-#   TUBSS_REF=v2.7.0 sudo -E ./tubss_launcher.sh   # pin to a release tag
+#   TUBSS_REF=v2.8.2 sudo -E ./tubss_launcher.sh   # pin to a release tag
 #==============================================================================
 
 YELLOW='\033[1;33m'

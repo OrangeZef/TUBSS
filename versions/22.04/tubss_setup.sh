@@ -1,118 +1,14 @@
 #!/bin/bash
 
 #==============================================================================
-# The Ubuntu/Debian Basic Setup Script (TUBSS)
-# Version: 2.9.0 (CC-175: realmd/sssd Active Directory domain join)
+# TUBSS — The Ubuntu/Debian Basic Setup Script
+# Version: 2.9.0
 # Author: OrangeZef
 #
-# This script automates the initial setup and hardening of a new Ubuntu or
-# Debian server. OS and version are auto-detected via /etc/os-release.
+# Automates the initial setup and hardening of a new Ubuntu or Debian
+# server. OS and version are auto-detected via /etc/os-release.
 #
-# Changelog:
-# - [v2.2] Integrated all code review recommendations.
-# - [v2.2] Added "strict mode" (set -euo pipefail) for improved script robustness.
-# - [v2.2] Spinner function now uses a more reliable process check (kill -0).
-# - [v2.2] User detection prefers $SUDO_USER for better reliability.
-# - [v2.2] Added an explicit warning for risky static IP configuration.
-# - [v2.2] Fixed a bug where Webmin installation would fail by adding its repository.
-# - [v2.2] Hardened all "yes/no" prompts to be more flexible.
-# - [v2.2] Improved disk usage retrieval logic to prevent "df" errors with strict mode.
-# - [v2.2] Corrected Btrfs filesystem detection to prevent "df: no file systems processed" error.
-# - [v2.2] Addressed an issue where Fail2ban configuration would fail on line 731 by using a more reliable `systemctl` command.
-# - [v2.3] Spinner now captures and reports background job exit codes (fail-fast).
-# - [v2.3] Fixed configure_ufw called BEFORE configure_fail2ban (banaction=ufw requires UFW active first).
-# - [v2.3] Added idempotency checks — hostname, UFW, fail2ban, auto-updates, telemetry, netplan, packages.
-# - [v2.3] Added netplan generate validation before netplan apply to prevent network lockout.
-# - [v2.3] Added Ubuntu version check at startup with supported version list.
-# - [v2.3] handle_error() now explicitly calls exit 1.
-# - [v2.3] Converted packages_to_install from string to bash array.
-# - [v2.3] Extracted display_config_summary() to eliminate DRY violation between show_summary_and_confirm() and reboot_prompt().
-# - [v2.3] Fixed logname fallback: uses ${SUDO_USER:-${USER:-root}} to avoid logname failure in non-TTY contexts.
-# - [v2.3] Added `unset AD_PASSWORD` at end of join_ad_domain() for credential hygiene.
-# - [v2.4] Added run_preflight() with disk, OS version, package server, and apt state checks.
-# - [v2.4] Added collect_custom_ufw_rules() and apply_custom_ufw_rules() for user-defined firewall rules.
-# - [v2.4] Added test_static_ip_connectivity() for post-apply network validation.
-# - [v2.4] Added run_rollback_ui() and --rollback flag for snapshot-based system recovery.
-# - [v2.5] Added run-state persistence (init/update/mark/finalize) with display at preflight.
-# - [v2.5] Fixed DHCP restore path — restore_dhcp_config() restores backup or writes minimal fallback.
-# - [v2.5] Added second-run skip warning for static netplan config.
-# - [v2.5] Added disable_cloud_init_network() to prevent cloud-init from overwriting managed netplan.
-# - [v2.5] Timestamped backup subdirectory for netplan conflict backups.
-# - [v2.5] Replaced test_static_ip_connectivity() with warn_if_gateway_unreachable() pre-write check.
-# - [v2.6] CC-103 P0: Static-IP bug fix — netplan try (auto-revert on lockout),
-#          fallback to force-reboot flag, cloud-init disable moved before write,
-#          explicit `renderer: networkd`, gateway-in-subnet validation,
-#          netplan generate stderr captured.
-# - [v2.6] CC-103 P1: cleanup() autoremove guard moved pre-install, ORIGINAL_IP
-#          headless-safe, dpkg-query replaces dpkg -l (rc-state false positive),
-#          unconditional AD credential scrub.
-# - [v2.6] CC-103 P2: --help/--version/--unattended/--dry-run CLI flags.
-# - [v2.6] CC-103 P3: dual-stream logging to /var/log/tubss.log (or /tmp),
-#          TTY-aware spinner, TUBSS_NO_LOG escape hatch, start/end markers.
-# - [v2.6] CC-103 P5: single script covers Ubuntu + Debian via os-release
-#          branching (SUPPORTED_VERSIONS, package server, fetch tool, network
-#          renderer). versions/ tree retained as safety net.
-# - [v2.7] CC-104: Opt-in SSH hardening (key-only auth, no-root, no-X11,
-#          no-empty-password) honoured only in manual mode.
-# - [v2.7] CC-104 Fix A: `netplan try` skipped when stdin is not a TTY —
-#          defers apply to reboot rather than risking silent revert.
-# - [v2.7] CC-104 Fix B: main() refuses to run without a TTY unless
-#          --unattended is set; defends against curl|bash invocations.
-# - [v2.7] CC-104 Fix C: STATUS=pending_reboot when the user declines a
-#          reboot with NETPLAN_APPLY_PENDING=1; configure_network refuses
-#          to skip when prior state was pending_reboot.
-# - [v2.7] CC-104 Fix D: refuse to run --unattended + static IP unless
-#          TUBSS_FORCE_REBOOT=1 acknowledges the remote-lockout risk.
-# - [v2.7] CC-104 Fix E: dry-run no longer performs real mutations on the
-#          interactive static-IP path (cloud-init disable, backup dir
-#          mkdir, conflicting netplan mv, reboot calls).
-# - [v2.9.0] CC-175: join_ad_domain() placeholder replaced with a real
-#          realmd/sssd implementation — `realm discover` preflight, then
-#          (once the new domain is confirmed reachable) realm leave when
-#          switching domains, then `realm join` with the password fed on
-#          stdin only (never argv, never the environment).
-# - [v2.9.0] CC-175: realmd/sssd/sssd-tools/libnss-sss/libpam-sss/adcli
-#          are installed by install_packages() only when JOIN_DOMAIN=yes,
-#          so a normal run is not bloated by them. Each is candidate-checked
-#          via the new pkg_available() helper first — Debian 14 (testing)
-#          has no sssd right now and an uninstallable package would
-#          otherwise abort the whole hardening run.
-# - [v2.9.0] CC-175: AD join failure is warn-and-continue (same policy as
-#          the CC-131/CC-133 apt-upgrade step) and is tracked in
-#          AD_JOIN_STATUS, which both summary tables now report.
-# - [v2.9.0] CC-175 audit fix 1: chrony joins the JOIN_DOMAIN=yes package
-#          set and ensure_time_sync() runs before `realm discover` —
-#          Kerberos rejects a clock skew over 5 minutes and nothing else in
-#          TUBSS touches the clock. A sync timeout warns and continues.
-# - [v2.9.0] CC-175 audit fix 2: a failed `realm discover` now says so
-#          explicitly when the same run is also switching this host to a
-#          new static DNS server — that DNS change only lands after the
-#          join step, so the failure is often expected rather than real.
-# - [v2.9.0] CC-175 audit fix 3: `pam-auth-update --enable mkhomedir` runs
-#          after a successful join so domain users get a home directory on
-#          first login. Warn-only if it fails.
-# - [v2.9.0] CC-175 audit fix 4: the password piped to `realm join` now
-#          carries a trailing newline — the form adcli/realm expect when
-#          reading a credential from a non-tty stdin.
-# - [v2.9.0] CC-175 audit fix 5: the `realm permit` scope is now an explicit
-#          prompt ([a]ll / [g]roup / [u]sers) instead of an unexamined
-#          PERMIT-ALL default. "All domain users" remains the default — the
-#          point is that it becomes a recorded choice, not an accident.
-#          Reported in both summary tables via AD_PERMIT_STATUS.
-# - [v2.9.0] CC-175 audit fix 6: key-only SSH hardening on a domain-joined
-#          host now appends a trailing sshd Match block re-allowing password
-#          auth for exactly the accounts `realm permit` allowed in — a domain
-#          account has no SSH key and no local password, so without this the
-#          hardening locks out the very users the join was for. Drop-in path
-#          only; the legacy sed-edit path prints the manual fix instead,
-#          because a later run's key append could land inside the Match block
-#          and be silently rescoped.
-# - [v2.9.0] CC-175 audit fix 7: optional sudo for domain accounts — the
-#          "Domain Admins" group (default yes) plus one optional named user.
-#          Every snippet is validated with `visudo -cf` on a temp copy and
-#          only then installed to /etc/sudoers.d/ at 0440. Note the group
-#          name must be backslash-escaped ('%domain\ admins'); the quoted
-#          form is rejected by visudo as an empty group.
+# Full changelog: git log --oneline -- tubss_setup.sh
 #
 # Provided by Joka.ca
 #==============================================================================
