@@ -2,7 +2,7 @@
 
 **TUBSS** is a comprehensive Bash script that automates the initial setup and hardening of a new Ubuntu or Debian server. With a single command, TUBSS saves time, ensures consistency, and establishes a secure, production-ready foundation.
 
-The script auto-detects OS/version via `/etc/os-release` — a single `tubss_setup.sh` at the repository root covers Ubuntu 20.04/22.04/24.04/26.04 (LTS) and Debian 11/12/13/14. The `versions/` tree is retained as a historical safety net. CI (lint, container tests, integration tests) runs against every one of those targets on every push — including Debian 14 (Forky), which is still Debian's testing suite rather than a stable release, so support there is best-effort and flagged as such at runtime.
+The script auto-detects OS/version via `/etc/os-release` — a single `tubss_setup.sh` at the repository root covers Ubuntu 20.04/22.04/24.04/26.04 (LTS) and Debian 11/12/13/14. CI (lint, container tests, integration tests) runs against every one of those targets on every push — including Debian 14 (Forky), which is still Debian's testing suite rather than a stable release, so support there is best-effort and flagged as such at runtime.
 
 ### Features
 

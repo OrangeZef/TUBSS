@@ -40,9 +40,19 @@ if [[ "$MODE" == "ssh-hardening-broken" ]]; then
     echo "TubssBogusDirectiveForCI981 yes" >> /etc/ssh/sshd_config
 fi
 
-# Execute
-if ! bash /root/tubss_setup.sh --unattended; then
+# Execute. Redirected to a genuine regular file (not just left to whatever
+# `docker exec`'s own stdout happens to be, e.g. a pipe back to the CI
+# runner) -- this is the actual failure mode of a real bug found in review:
+# spinner()'s /dev/tty fallback used to re-open its output path with `>` on
+# every single animation frame, which truncates a REGULAR FILE back to zero
+# bytes each time (a pipe doesn't have this problem, which is exactly how
+# this slipped past every other CI check here). Asserted further down —
+# TUBSS_STDOUT_LOG's content spanning early-to-late markers is the actual
+# regression test for that bug class.
+TUBSS_STDOUT_LOG=/root/tubss-stdout.log
+if ! bash /root/tubss_setup.sh --unattended > "$TUBSS_STDOUT_LOG" 2>&1; then
     echo "[FATAL] Script exited non-zero"
+    cat "$TUBSS_STDOUT_LOG"
     exit 1
 fi
 
@@ -64,6 +74,14 @@ assert_pkg_installed unattended-upgrades
 assert_service_enabled fail2ban
 assert_file_exists /var/log/tubss.log
 assert_file_contains /var/log/tubss.log 'run ended rc=0'
+# Spinner-truncation regression guard: the script's own raw stdout, captured
+# to a real file above, must contain BOTH an early marker (from the very
+# first spinner-driven step) and the final marker -- if the fd-truncation
+# bug ever comes back, later spinner frames wipe earlier content and only
+# the last thing written survives.
+assert_file_exists "$TUBSS_STDOUT_LOG"
+assert_file_contains "$TUBSS_STDOUT_LOG" 'Updating package lists'
+assert_file_contains "$TUBSS_STDOUT_LOG" 'run ended rc=0'
 # CC-131: apt upgrade step must have executed (not just update)
 assert_file_contains /var/log/tubss.log 'Applying pending package updates'
 assert_file_contains /var/log/tubss.log 'Package updates applied'
