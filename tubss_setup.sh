@@ -248,11 +248,25 @@ spinner() {
     fi
     echo -ne "${YELLOW}[TUBSS] ${task_name} ... ${NC}" >&"$sp_fd"
     if [[ ${TUBSS_TTY:-1} -ne 1 ]]; then
+        # Without a real TTY, a per-frame dot every 0.1s used to accumulate
+        # into an unreadable wall of hundreds of dots for anything that
+        # takes more than a few seconds (a real apt-get install run easily
+        # produces 500+) -- visually meaningless: no indication of whether
+        # it's still alive or how far along it is. Report elapsed time on
+        # its own line every 2s instead: informative, and short operations
+        # (the common case) finish before the first report ever prints.
+        local start_s=$SECONDS
+        local last_report=0
+        local elapsed=0
         while kill -0 "$pid" 2>/dev/null; do
-            printf "." >&"$sp_fd"
             sleep $delay
+            elapsed=$(( SECONDS - start_s ))
+            if (( elapsed - last_report >= 2 )); then
+                printf "\n  ... still working (%ds elapsed)" "$elapsed" >&"$sp_fd"
+                last_report=$elapsed
+            fi
         done
-        printf " \n" >&"$sp_fd"
+        printf " done (%ds)\n" "$elapsed" >&"$sp_fd"
         exec {sp_fd}>&-
         return
     fi
@@ -1089,6 +1103,20 @@ get_user_configuration() {
         CONFIG_CHOICE=$(echo "$CONFIG_CHOICE" | tr '[:upper:]' '[:lower:]')
     fi
 
+    # Verbose display is a display preference, not a system-config choice,
+    # but it affects how readable the WHOLE run is -- ask it once, up
+    # front, rather than expecting the operator to already know about
+    # --verbose/TUBSS_VERBOSE before starting. "default" mode skips this
+    # (its whole point is fast, no-questions-asked setup); can still be set
+    # via --verbose or TUBSS_VERBOSE=1 either way.
+    if [[ "$CONFIG_CHOICE" == "manual" ]] && (( TUBSS_VERBOSE != 1 )); then
+        local _verbose_choice
+        prompt _verbose_choice "Show real command output instead of a progress spinner? (yes/no) [no]: "
+        if [[ "$_verbose_choice" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+            TUBSS_VERBOSE=1
+        fi
+    fi
+
     # User Configuration Prompts
     echo -e "${YELLOW}--------------------------------------------------------${NC}"
     echo -e "${YELLOW}     Please provide your configuration choices.${NC}"
@@ -1239,12 +1267,7 @@ get_user_configuration() {
                 fi
             done
         fi
-        # RECOMMENDED: Add explicit warning for risky static IP change
-        echo ""
-        echo -e "${RED}!! WARNING !!${NC}"
-        echo -e "${YELLOW}You have chosen to configure a static IP address.${NC}"
-        echo -e "${YELLOW}Incorrect network settings (IP, Gateway, etc.) can result in a loss of network connectivity, requiring console access to fix.${NC}"
-        echo -e "${YELLOW}Please double-check your entries in the summary screen.${NC}"
+        echo -e "${RED}!! WARNING !!${NC} ${YELLOW}Incorrect static IP settings can cut off network access, requiring console access to fix — double-check your entries in the summary screen.${NC}"
         prompt REPLY "Press Enter to acknowledge and continue..."
     fi
 
@@ -1315,8 +1338,7 @@ get_user_configuration() {
         else
             AUTO_REBOOT_UPDATES="no"
         fi
-        echo -e "${YELLOW}Mainly useful for hardened/compliance-flavored boxes, not a personal homelab server.${NC}"
-        prompt ENABLE_MOTD_BANNER "Show a standard authorized-access-only warning banner at login (/etc/motd)? (yes/no) [no]: "
+        prompt ENABLE_MOTD_BANNER "Show a standard authorized-access-only warning banner at login? (yes/no) [no]: "
         ENABLE_MOTD_BANNER=${ENABLE_MOTD_BANNER:-no}
         prompt INSTALL_FAIL2BAN "Do you want to install Fail2ban? (yes/no) [yes]: "
         INSTALL_FAIL2BAN=${INSTALL_FAIL2BAN:-yes}
@@ -1329,7 +1351,6 @@ get_user_configuration() {
         SSH_HARDENING=$(echo "$SSH_HARDENING" | tr '[:upper:]' '[:lower:]')
         if [[ "$SSH_HARDENING" =~ ^([yY][eE][sS]|[yY])$ ]]; then
             SSH_HARDENING="yes"
-            echo -e "${YELLOW}--- SSH Hardening Options ---${NC}"
             echo -e "${YELLOW}Answering yes disables SSH password login entirely — only SSH keys will work. You'll be locked out if you don't have a key set up (TUBSS checks for one first and refuses if it can't find it).${NC}"
             prompt SSH_DISABLE_PW_AUTH "  Disable SSH password login and require SSH keys only? (yes/no) [yes]: "
             SSH_DISABLE_PW_AUTH=${SSH_DISABLE_PW_AUTH:-yes}
@@ -1423,15 +1444,13 @@ get_user_configuration() {
             AD_SUDO_EXTRA_USER=""
         fi
     elif [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        echo ""
-        echo -e "${YELLOW}--- Active Directory Details ---${NC}"
         # AD_DOMAIN/AD_USER predate the permit/sudo fields above and never
         # got the same validation — a value like "--help" would otherwise
         # pass straight through as an unintended flag to `realm` (argument
         # injection; low severity, but the same class of gap, so closing it
         # for consistency).
         while true; do
-            prompt AD_DOMAIN "Enter the Active Directory domain name (e.g., joka.ca): "
+            prompt AD_DOMAIN "Enter the Active Directory domain name (e.g., corp.example.com): "
             if [[ -n "$AD_DOMAIN" ]] && _is_safe_ad_identifier "$AD_DOMAIN"; then
                 break
             else
@@ -1439,28 +1458,22 @@ get_user_configuration() {
             fi
         done
         while true; do
-            prompt AD_USER "Enter the domain administrator username (e.g., admin.user): "
+            prompt AD_USER "Enter a domain account with permission to join computers to the domain (e.g., a service account like svc-join, or your own admin account): "
             if [[ -n "$AD_USER" ]] && _is_safe_ad_identifier "$AD_USER"; then
                 break
             else
                 echo -e "${RED}Enter a username using letters, digits, dots, underscores, hyphens, '@', or apostrophes.${NC}"
             fi
         done
-        echo "Enter the password for the administrator account."
-        echo "Note: The password will not be displayed as you type."
-        prompt_secret AD_PASSWORD "Password: "
+        echo -e "${YELLOW}Not displayed as you type.${NC}"
+        prompt_secret AD_PASSWORD "Enter the password for that account: "
 
         # Who may log in once the box is joined. A bare `realm join` leaves
         # realmd at its PERMIT-ALL default, so "every domain user can log in"
         # is what you get whether or not you thought about it. TUBSS keeps
         # that as the default (this is a homelab join, not a bastion) but
         # makes it a deliberate, recorded choice instead of an accident.
-        echo ""
-        echo -e "${YELLOW}--- Domain Login Access ---${NC}"
-        echo "By default, anyone in the domain can log in once this box is joined —"
-        echo "that's how most homelab/office AD setups already work. Restrict this"
-        echo "below only if you want just a specific group or specific people to"
-        echo "be able to log in at all (this is separate from sudo, asked next)."
+        echo -e "${YELLOW}Default is everyone in the domain, matching how most homelab/office AD setups already work — restrict below only if you want it narrower (separate from sudo, asked next).${NC}"
         while true; do
             # Full words to match every other multi-choice prompt in this
             # script (CONFIG_CHOICE, NET_TYPE); the single letters still work
@@ -1518,7 +1531,7 @@ get_user_configuration() {
         AD_GRANT_ADMINS_SUDO=$(echo "$AD_GRANT_ADMINS_SUDO" | tr '[:upper:]' '[:lower:]')
         local _sudo_extra_prompt
         if [[ "$AD_BARE_USERNAMES" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-            _sudo_extra_prompt="Additionally grant sudo to one specific domain username — bare username, e.g. 'julius' (optional, leave blank to skip): "
+            _sudo_extra_prompt="Additionally grant sudo to one specific domain username — bare username, e.g. 'jsmith' (optional, leave blank to skip): "
         else
             _sudo_extra_prompt="Additionally grant sudo to one specific domain username — enter it in whatever format sssd will resolve at login (optional, leave blank to skip): "
         fi
@@ -1544,10 +1557,7 @@ get_user_configuration() {
 # --- Feature 2: Collect Custom UFW Rules ---
 collect_custom_ufw_rules() {
     local add_rule port proto dir desc rule_count=0
-    echo ""
-    echo -e "${YELLOW}--- Custom Firewall Rules ---${NC}"
-    echo -e "You may add up to 20 custom UFW rules. Port ranges use a hyphen (e.g., 5000-5010)."
-    echo ""
+    echo -e "${YELLOW}You may add up to 20 custom UFW rules. Port ranges use a hyphen (e.g., 5000-5010).${NC}"
 
     while true; do
         if (( rule_count >= 20 )); then
@@ -1991,7 +2001,7 @@ apply_configuration() {
 
 # --- Debian-only: AppArmor GRUB boot parameter setup ---
 configure_apparmor_debian() {
-    echo -ne "${YELLOW}[TUBSS] Checking AppArmor boot parameters (Debian)... ${NC}"
+    echo -e "${YELLOW}[TUBSS] Checking AppArmor boot parameters (Debian)... ${NC}"
     local grub_file="/etc/default/grub"
     if [[ ! -f "$grub_file" ]]; then
         echo -e "${YELLOW}[WARN]${NC} GRUB config not found — skipping AppArmor boot parameter setup."
@@ -2065,11 +2075,16 @@ configure_hostname() {
 
 install_packages() {
     local packages_to_install=()
-    echo -ne "${YELLOW}[TUBSS] Updating package lists...${NC}"
     if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
-        echo ""
+        echo -e "${YELLOW}[TUBSS] Updating package lists...${NC}"
         echo "[DRY-RUN] apt-get update -y"
     else
+        # No announce here -- run_step()'s own spinner prints "[TUBSS]
+        # Updating package lists ..." immediately via its own bypass of
+        # setup_logging()'s tee pipe. A duplicate announce here used to sit
+        # buffered in that pipe (no trailing newline) until some LATER
+        # line's newline flushed it, causing the same text to render
+        # twice, out of order, merged into whatever printed after it.
         run_step "Updating package lists" apt-get update -y || { echo -e "\n${RED}[ERROR]${NC} Updating package lists failed (exit $?)"; exit 1; }
     fi
     echo -e "${GREEN}[OK]${NC} Package lists updated."
@@ -2094,12 +2109,13 @@ install_packages() {
     # even if the upgrade step itself stumbles. Set PACKAGE_UPDATES_STATUS
     # so the final summary reflects reality.
     PACKAGE_UPDATES_STATUS="Applied"
-    echo -ne "${YELLOW}[TUBSS] Applying pending package updates...${NC}"
     if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
-        echo ""
+        echo -e "${YELLOW}[TUBSS] Applying pending package updates...${NC}"
         echo "[DRY-RUN] apt-get upgrade -y (--force-confdef --force-confold)"
         echo -e "${GREEN}[OK]${NC} Package updates applied."
     else
+        # No announce here -- see the matching comment in the previous
+        # step (Updating package lists) for why.
         if run_step "Applying pending package updates" \
             env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive \
             apt-get -y \
@@ -2230,7 +2246,7 @@ install_packages() {
     # Add Webmin APT repository if Webmin installation is requested
     if [[ "$INSTALL_WEBMIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         if ! pkg_installed webmin; then
-            echo -ne "${YELLOW}[TUBSS] Adding Webmin repository...${NC}"
+            echo -e "${YELLOW}[TUBSS] Adding Webmin repository...${NC}"
             if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
                 echo ""
                 echo "[DRY-RUN] add Webmin APT repo + key + apt-get update"
@@ -2257,11 +2273,12 @@ install_packages() {
     # that an interrupted install still triggers cleanup on exit.
     if [[ ${#packages_to_install[@]} -gt 0 ]]; then
         PACKAGES_INSTALLED=1
-        echo -ne "${YELLOW}[TUBSS] Installing packages...${NC}"
         if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
-            echo ""
+            echo -e "${YELLOW}[TUBSS] Installing packages...${NC}"
             echo "[DRY-RUN] apt-get install -y ${packages_to_install[*]}"
         else
+            # No announce here -- see the matching comment on the
+            # "Updating package lists" step for why.
             run_step "Installing packages" env NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages_to_install[@]}" || { echo -e "\n${RED}[ERROR]${NC} Installing packages failed (exit $?)"; exit 1; }
         fi
         echo -e "${GREEN}[OK]${NC} All selected packages installed successfully."
@@ -2452,7 +2469,7 @@ _netplan_apply_or_try() {
 configure_network() {
     local renderer
     renderer=$(_network_renderer)
-    echo -ne "${YELLOW}[TUBSS] Configuring Network (renderer=${renderer})... ${NC}"
+    echo -e "${YELLOW}[TUBSS] Configuring Network (renderer=${renderer})... ${NC}"
 
     if [[ "$renderer" == "ifupdown" ]]; then
         _configure_network_ifupdown
@@ -2636,7 +2653,7 @@ warn_if_gateway_unreachable() {
     [[ "$NET_TYPE" != "static" ]] && return 0
     [[ -z "${GATEWAY:-}" ]] && return 0
 
-    echo -ne "${YELLOW}[TUBSS] Checking gateway reachability before writing config... ${NC}"
+    echo -e "${YELLOW}[TUBSS] Checking gateway reachability before writing config... ${NC}"
     if ping -c 2 -W 2 "$GATEWAY" > /dev/null 2>&1; then
         echo -e "${GREEN}[OK]${NC} Gateway ${GATEWAY} is reachable."
     else
@@ -2650,7 +2667,7 @@ warn_if_gateway_unreachable() {
 
 configure_ufw() {
     if [[ "$ENABLE_UFW" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        echo -ne "${YELLOW}[TUBSS] Configuring UFW... ${NC}"
+        echo -e "${YELLOW}[TUBSS] Configuring UFW... ${NC}"
         if ufw status 2>/dev/null | grep -q "Status: active"; then
             echo -e "  ${GREEN}[SKIP]${NC} UFW already active"
         elif [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
@@ -2747,7 +2764,7 @@ apply_custom_ufw_rules() {
 configure_fail2ban() {
     local jail_file
     if [[ "$INSTALL_FAIL2BAN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        echo -ne "${YELLOW}[TUBSS] Configuring Fail2ban... ${NC}"
+        echo -e "${YELLOW}[TUBSS] Configuring Fail2ban... ${NC}"
         jail_file="/etc/fail2ban/jail.local"
 
         if [[ -f "$jail_file" ]]; then
@@ -3067,7 +3084,7 @@ configure_ssh_hardening() {
 
 configure_auto_updates() {
     if [[ "$ENABLE_AUTO_UPDATES" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        echo -ne "${YELLOW}[TUBSS] Enabling Automatic Security Updates... ${NC}"
+        echo -e "${YELLOW}[TUBSS] Enabling Automatic Security Updates... ${NC}"
         if [[ -f /etc/apt/apt.conf.d/20auto-upgrades ]]; then
             echo -e "  ${GREEN}[SKIP]${NC} Auto-updates already configured"
         elif [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
@@ -3143,7 +3160,7 @@ configure_motd_banner() {
     local _motd_border='***************************************************************************'
     local _motd_unique_line='This system is for authorized use only. All activity on this system may be'
     if [[ "$ENABLE_MOTD_BANNER" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        echo -ne "${YELLOW}[TUBSS] Configuring login banner... ${NC}"
+        echo -e "${YELLOW}[TUBSS] Configuring login banner... ${NC}"
         if grep -qF "$_motd_unique_line" /etc/motd 2>/dev/null; then
             echo -e "  ${GREEN}[SKIP]${NC} Login banner already configured"
         elif [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
@@ -3259,7 +3276,7 @@ disable_telemetry() {
             echo -e "${GREEN}[OK]${NC} Telemetry N/A on Debian — no ubuntu-report installed."
             return 0
         fi
-        echo -ne "${YELLOW}[TUBSS] Disabling Ubuntu Telemetry... ${NC}"
+        echo -e "${YELLOW}[TUBSS] Disabling Ubuntu Telemetry... ${NC}"
         if grep -q "^enable = false" /etc/ubuntu-report/ubuntu-report.conf 2>/dev/null; then
             echo -e "  ${GREEN}[SKIP]${NC} Telemetry already disabled"
         elif [ -f /etc/ubuntu-report/ubuntu-report.conf ]; then
