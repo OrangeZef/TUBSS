@@ -13,10 +13,6 @@
 # Provided by Joka.ca
 #==============================================================================
 
-# --- Strict Mode ---
-# set -e: Exit immediately if a command exits with a non-zero status.
-# set -u: Treat unset variables as an error.
-# set -o pipefail: The return value of a pipeline is the status of the last command to exit with a non-zero status.
 set -euo pipefail
 
 # --- Global Variables & Colors ---
@@ -25,10 +21,9 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
-# --- Version (must be defined before BANNER_ART, which interpolates it) ---
+# Must be defined before BANNER_ART, which interpolates it.
 TUBSS_SCRIPT_VERSION="2.9.0"
 
-# Define ANSI art for headers
 BANNER_ART="
 +---------------------------------------------+
 |    T U B S S                                |
@@ -79,110 +74,82 @@ NEW_SSH_HARDENING_SUMMARY=""
 NEW_AD_PERMIT_SUMMARY=""
 NEW_AD_SUDO_SUMMARY=""
 NEW_AD_IDENTITY_SUMMARY=""
-# CC-133: set to "Applied", "Partial (upgrade failed, continuing)", or
-# left at "pending" if we never reached the upgrade step (dry-run exits
-# before install_packages in some paths, or a fatal earlier error).
+# "pending" until install_packages() runs, then "Applied" or
+# "Partial (upgrade failed, continuing)".
 PACKAGE_UPDATES_STATUS="pending"
-# CC-175: real outcome of the AD domain join step. "pending" until
-# join_ad_domain() runs, then one of "Skipped", "Joined (<domain>)",
+# "pending" until join_ad_domain() runs, then "Skipped", "Joined (<domain>)",
 # "Joined (dry-run)" or "Failed (<reason>)".
 AD_JOIN_STATUS="pending"
-# CC-175 follow-up: who is allowed onto the box after the join, and who gets
-# sudo. AD_PERMIT_MODE is "a" (all domain users — realmd's own default), "g"
-# (one group) or "u" (named users); it is chosen interactively in manual
-# mode, or pre-seeded via environment in unattended mode (see
-# get_user_configuration()'s CONFIG_CHOICE=="default" branch). Either way it
-# drives BOTH the `realm permit` call and the sshd Match block that
-# re-allows password auth for those same accounts when key-only hardening
-# is on.
-#
-# These use ${VAR:-} rather than a bare `VAR=""` specifically so that a
-# pre-seeded environment value (the whole point of the unattended path)
-# survives this initialization instead of being clobbered by it — a bare
-# assignment here would silently discard AD_PERMIT_MODE=group/AD_GRANT_
-# ADMINS_SUDO=no/etc. before the unattended branch ever got to read them.
+# Who is allowed onto the box after the join, and who gets sudo.
+# AD_PERMIT_MODE is "a" (all domain users), "g" (one group) or "u" (named
+# users); it drives BOTH the `realm permit` call and the sshd Match block
+# that re-allows password auth for those accounts under key-only hardening.
+# ${VAR:-} rather than VAR="" so pre-seeded unattended-mode environment
+# values survive this initialization instead of being clobbered.
 AD_PERMIT_MODE="${AD_PERMIT_MODE:-}"
 AD_PERMIT_GROUP="${AD_PERMIT_GROUP:-}"
 AD_PERMIT_USERS="${AD_PERMIT_USERS:-}"
 AD_GRANT_ADMINS_SUDO="${AD_GRANT_ADMINS_SUDO:-}"
 AD_SUDO_EXTRA_USER="${AD_SUDO_EXTRA_USER:-}"
-# Whether to configure sssd for bare-username logins (no @domain suffix
-# needed) after a successful join. Opt-out, not opt-in: defaults to yes,
-# since that's what most people expect ("julius" not "julius@joka.ca"),
-# but it IS a real config change to a live auth path, so it's a choice,
-# not something forced unconditionally.
+# Configure sssd for bare-username logins (no @domain suffix) after a
+# successful join. Opt-out rather than opt-in — it's what operators expect,
+# but it's still a real change to a live auth path, so it stays a choice.
 AD_BARE_USERNAMES="${AD_BARE_USERNAMES:-}"
-# Outcomes of the permit call and the sudoers install, rendered in both
-# summary tables next to AD_JOIN_STATUS. "pending" until the join step runs.
 AD_PERMIT_STATUS="pending"
 AD_SUDO_STATUS="pending"
-# Outcome of the post-join `id` identity check on the join account
-# specifically. This is a stronger real-world signal than AD_JOIN_STATUS
-# alone: `realm join` succeeding only proves the realmd handshake worked,
-# not that NSS/sssd is actually resolving identities — a box that reports
-# "Joined" but fails this check is very likely NOT usable for real logins
-# despite realm's own success. "pending" until the join step runs.
+# Post-join `id` check on the join account. Stronger signal than
+# AD_JOIN_STATUS: `realm join` only proves the realmd handshake worked, not
+# that NSS/sssd actually resolves identities, so "Joined" plus a failed
+# identity check means the box likely can't do real logins.
 AD_IDENTITY_STATUS="pending"
 
-# --- SSH hardening toggles (CC-104) ---
-# Feature is OFF by default. When SSH_HARDENING="yes", the individual
-# toggles below determine which sshd settings are applied. --unattended
-# keeps SSH_HARDENING="no" to avoid silent SSH lockout, UNLESS the caller
-# has pre-seeded SSH_HARDENING=yes in the environment (documented opt-in
-# for integration tests / automation).
+# --- SSH hardening toggles ---
+# OFF by default to avoid silent SSH lockout, including under --unattended,
+# unless the caller pre-seeds SSH_HARDENING=yes in the environment.
 SSH_HARDENING="${SSH_HARDENING:-no}"
 SSH_DISABLE_PW_AUTH="${SSH_DISABLE_PW_AUTH:-yes}"
 SSH_DISABLE_ROOT="${SSH_DISABLE_ROOT:-yes}"
 SSH_DISABLE_X11="${SSH_DISABLE_X11:-yes}"
 SSH_DISABLE_EMPTY_PW="${SSH_DISABLE_EMPTY_PW:-yes}"
-# CC-181: real outcome of configure_ssh_hardening(), rendered in the
-# end-of-run issue summary. "pending" until that step runs.
 SSH_HARDENING_STATUS="pending"
 SNAPSHOT_STATUS="pending"
 
 # Auto-reboot after a required unattended security update (e.g. a new
-# kernel) — OFF by default, same reasoning as SSH_HARDENING above: a server
-# that needs to stay up until a human approves a reboot must never get one
-# it didn't ask for. --unattended keeps this "no" unless the caller has
-# pre-seeded AUTO_REBOOT_UPDATES=yes in the environment.
+# kernel). OFF by default for the same reason as SSH_HARDENING: never
+# reboot a server the operator didn't ask to have rebooted.
 AUTO_REBOOT_UPDATES="${AUTO_REBOOT_UPDATES:-no}"
 
-# --- Custom UFW rules array ---
-# Elements: "port|protocol|direction|description"
-# Port ranges use hyphen: "5000-5010|tcp|allow|Dev range"
+# Elements: "port|protocol|direction|description". Ranges use a hyphen:
+# "5000-5010|tcp|allow|Dev range"
 CUSTOM_UFW_RULES=()
 
-# --- Pre-flight state ---
 PREFLIGHT_FAILED=0
 
-# --- Package installation state (used by cleanup guard) ---
+# Used by the cleanup guard.
 PACKAGES_INSTALLED=0
 
 # --- OS / version detection globals (set by detect_os, read elsewhere) ---
 DETECTED_OS=""                 # "ubuntu" or "debian"
 DETECTED_VERSION=""
-# DETECTED_CODENAME: used as a fallback to resolve DETECTED_VERSION when
-# VERSION_ID is absent from /etc/os-release (see detect_os()).
+# Fallback for resolving DETECTED_VERSION when VERSION_ID is absent from
+# /etc/os-release (see detect_os()).
 DETECTED_CODENAME=""
 SUPPORTED_VERSIONS=()          # Populated in detect_os based on DETECTED_OS
 PACKAGE_SERVER=""              # archive.ubuntu.com or deb.debian.org
 DEBIAN_TESTING_TIER=0          # 1 for Debian 14 (Forky / testing) warning
 
-# --- Network globals (safe defaults to avoid unbound variable under set -u) ---
+# Safe default to avoid an unbound variable under set -u.
 ORIGINAL_IP=""
 
-# --- Post-apply network state ---
-NETPLAN_APPLY_PENDING=0        # P0: forces reboot if netplan try/apply failed
+NETPLAN_APPLY_PENDING=0        # forces reboot if netplan try/apply failed
 
 # --- Run-state persistence ---
-# (TUBSS_SCRIPT_VERSION is defined earlier, before BANNER_ART, so the banner
-# can interpolate it — keep it as the single source of truth.)
 TUBSS_STATE_DIR="/var/lib/tubss"
 TUBSS_STATE_FILE="/var/lib/tubss/last_run"
 CURRENT_STEP=""
 DHCP_RESTORE_FILE=""
 
-# --- CLI / runtime flags (P2) ---
+# --- CLI / runtime flags ---
 # Declared with defaults so `set -u` does not trip before parse_args.
 TUBSS_UNATTENDED=${TUBSS_UNATTENDED:-0}
 TUBSS_DRY_RUN=${TUBSS_DRY_RUN:-0}
@@ -196,7 +163,6 @@ TUBSS_ROLLBACK=0
 
 # --- Utility Functions ---
 
-# Function to handle errors and exit gracefully
 handle_error() {
     local exit_code=$?
     mark_run_state_failed "${CURRENT_STEP:-unknown}"
@@ -208,38 +174,26 @@ handle_error() {
     echo -e "${RED}Exiting script with status code: ${exit_code}${NC}"
     echo -e "${RED}--------------------------------------------------------${NC}"
     echo ""
-    exit 1
+    exit "$exit_code"
 }
 
-# Function to display a simple progress spinner with task name.
-# When not attached to a TTY (logs, CI) we emit dots instead of backspace
-# animation so the captured log remains readable.
+# Progress spinner with task name; falls back to periodic elapsed-time
+# lines when not on a TTY so captured logs stay readable.
 #
-# Writes to /dev/tty when available, bypassing setup_logging()'s
-# line-buffered tee pipe (same reasoning as prompt() below: that pipe reads
-# via `read -r line`, which blocks until a trailing newline arrives. Every
-# spinner frame is deliberately NOT newline-terminated until the step
-# finishes, so on stdout it sat invisibly in that buffer and only flushed,
-# all at once, the instant the backgrounded command completed -- making any
-# long-running step look completely frozen in a real interactive session,
-# indistinguishable from a genuine hang. Ephemeral animation frames were
-# never captured in the log anyway (same as prompt() text), so bypassing
-# via /dev/tty loses nothing there while fixing live visibility.
+# Writes to /dev/tty when available to bypass setup_logging()'s
+# line-buffered tee pipe: spinner frames are not newline-terminated, so
+# that pipe holds them until the step finishes and every long step looks
+# frozen. Animation frames are never worth capturing in the log anyway.
 spinner() {
     local pid=$1
     local task_name=$2
     local delay=0.1
     local spinstr='|/-\'
-    # Open the output fd ONCE and reuse it for every frame, rather than
-    # `> "$out"` per write. A plain `>` redirect to a path re-opens the
-    # file with O_TRUNC on every single call — against a regular file
-    # (TUBSS_NO_LOG=1 redirected to a log file, a systemd unit's
-    # StandardOutput=file:, a cron redirect) each animation frame
-    # truncated the file back to zero bytes, destroying everything
-    # written before it. Confirmed: three frames wiped prior output down
-    # to nothing. Duplicating the fd once with `exec {fd}>...` shares one
-    # open file description (and its offset) across every write, so
-    # frames append correctly instead of re-truncating.
+    # Open the output fd ONCE and reuse it for every frame. A per-write
+    # `> "$path"` redirect re-opens with O_TRUNC each time, which against a
+    # regular file (systemd StandardOutput=file:, cron redirect) wipes all
+    # prior output on every frame. One `exec {fd}>` shares a single open
+    # file description, so frames append.
     local sp_fd
     if { : > /dev/tty; } 2>/dev/null; then
         exec {sp_fd}> /dev/tty
@@ -248,13 +202,9 @@ spinner() {
     fi
     echo -ne "${YELLOW}[TUBSS] ${task_name} ... ${NC}" >&"$sp_fd"
     if [[ ${TUBSS_TTY:-1} -ne 1 ]]; then
-        # Without a real TTY, a per-frame dot every 0.1s used to accumulate
-        # into an unreadable wall of hundreds of dots for anything that
-        # takes more than a few seconds (a real apt-get install run easily
-        # produces 500+) -- visually meaningless: no indication of whether
-        # it's still alive or how far along it is. Report elapsed time on
-        # its own line every 2s instead: informative, and short operations
-        # (the common case) finish before the first report ever prints.
+        # Report elapsed time every 2s rather than a per-frame dot, which
+        # produced hundreds of meaningless dots for a long apt-get run.
+        # Short operations finish before the first report prints.
         local start_s=$SECONDS
         local last_report=0
         local elapsed=0
@@ -270,7 +220,6 @@ spinner() {
         exec {sp_fd}>&-
         return
     fi
-    # Use kill -0 for a more robust check
     while kill -0 "$pid" 2>/dev/null; do
         local temp=${spinstr#?}
         printf "\b${spinstr:0:1}" >&"$sp_fd"
@@ -281,11 +230,9 @@ spinner() {
     exec {sp_fd}>&-
 }
 
-# Runs a command either behind the spinner (output hidden, the default) or,
-# under TUBSS_VERBOSE=1 / --verbose, in the foreground with its real output
-# visible. Returns the command's real exit status either way, so callers
-# keep their own `run_step ... || { existing error handling }` unchanged —
-# only how the command's own output is shown differs.
+# Runs a command behind the spinner (output hidden) or, under --verbose, in
+# the foreground with output visible. Returns the command's real exit status
+# either way so callers' `run_step ... || ...` handling is unaffected.
 run_step() {
     local label="$1"; shift
     if (( TUBSS_VERBOSE == 1 )); then
@@ -299,7 +246,7 @@ run_step() {
     wait "$pid"
 }
 
-# Function to convert CIDR prefix to a dotted-decimal subnet mask
+# Convert a CIDR prefix to a dotted-decimal subnet mask.
 cidr2mask() {
     local cidr=$1
     local i
@@ -317,85 +264,63 @@ cidr2mask() {
     echo "${mask%.}"
 }
 
-# P1: dpkg -l matches rc-state (removed, config-files) as a false "installed".
-# dpkg-query --status checks the true install state only. Returns 0 when the
-# package is in `install ok installed`, non-zero otherwise.
+# Returns 0 only when the package is in `install ok installed`. `dpkg -l`
+# is not usable here: it also matches rc-state (removed, config-files left).
 pkg_installed() {
     local pkg="$1"
     dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null \
         | grep -q '^install ok installed$'
 }
 
-# CC-175: true when apt has a real installation candidate for $1.
-# `apt-cache policy` prints nothing for an unknown package and
-# "Candidate: (none)" for one that is only referenced by a dependency, so a
-# candidate line that does not start with "(" is the reliable signal.
-# Needed because Debian testing (14/Forky) periodically drops packages such
-# as sssd from the archive — asking apt-get to install one of those would
-# abort the whole TUBSS run.
+# True when apt has a real install candidate for $1 ("Candidate: (none)"
+# means no). Debian testing periodically drops packages, and asking
+# apt-get for a missing one aborts the whole run.
 #
-# The output is captured first rather than piped into `grep -q`: under
-# `set -o pipefail`, grep -q exits on the first match and the still-writing
-# apt-cache takes SIGPIPE, which turns a successful match into a 141 exit.
+# Output is captured before grepping: under pipefail, `grep -q` exits early
+# and apt-cache takes SIGPIPE, turning a match into exit 141.
 #
-# LC_ALL=C is load-bearing, not cosmetic: "Candidate:" is a gettext-
-# translated apt string ("Installationskandidat:" in de, "Candidat" in fr,
-# etc). `sudo` preserves the invoking operator's locale by default (LANG/
-# LANGUAGE/LC_* are in sudo's built-in env_check table), so on any non-
-# English-locale server this grep would silently match nothing for every
-# package — confirmed by reproducing it end-to-end under LANG=de_DE.UTF-8:
-# the entire base package set (ufw, apparmor, unattended-upgrades, curl)
-# got skipped as "unavailable" even with a freshly updated apt cache. This
-# now sits on the path of every TUBSS run (not just the opt-in AD package
-# loop this function was originally written for), so a locale mismatch
-# here isn't a cosmetic wrong-language message, it silently strips core
-# hardening from the box. LC_ALL=C also neutralizes LANGUAGE (gettext
-# ignores it once LC_ALL forces the C locale).
+# LC_ALL=C is required: "Candidate:" is gettext-translated and sudo
+# preserves the operator's locale, so on a non-English locale this would
+# silently match nothing and skip every package install.
 pkg_available() {
     local pkg="$1" policy
     policy=$(LC_ALL=C apt-cache policy "$pkg" 2>/dev/null) || return 1
     grep -q '^  Candidate: [^(]' <<< "$policy"
 }
 
-# CC-175 security fix: reject anything that isn't a plain AD username/group
-# identifier before it reaches a sudoers line or a `realm permit` argument.
-# AD_SUDO_EXTRA_USER is concatenated directly into a sudoers rule string —
-# an unvalidated value containing sudoers' comment character can neutralize
-# the rest of the line and inject an attacker-controlled rule. Confirmed
-# exploitable in testing: AD_SUDO_EXTRA_USER="attacker ALL=(ALL) NOPASSWD:ALL #"
-# produces the sudoers line `attacker ALL=(ALL) NOPASSWD:ALL # ALL=(ALL:ALL) ALL`
-# — `visudo -cf` accepts it as valid syntax (everything after '#' is a
-# comment) and TUBSS would install full passwordless root for "attacker".
-# No newline needed; a single '#' on one line is enough. Applies equally to
-# AD_PERMIT_GROUP/AD_PERMIT_USERS, which don't have the sudoers-injection
-# risk but could otherwise pass a leading '-' as an unintended flag to
-# `realm permit`.
+# SECURITY: gate for any value that reaches a sudoers line or a
+# `realm permit` argument. AD_SUDO_EXTRA_USER is concatenated straight into
+# a sudoers rule, so a value containing '#' comments out the rest of the
+# line and injects an attacker-controlled rule that visudo accepts as valid.
+# A leading '-' would also be read as a flag by `realm permit`.
 #
-# Deliberately restrictive rather than trying to enumerate every character
-# sudoers/realm would reject: must start with an alphanumeric, dot, or
-# underscore (blocks a leading '-' or space), then only alphanumerics,
-# dots, underscores, spaces, hyphens, '@', or "'" (blocks '#', '=', '(',
-# ')', ':', double quotes, backslashes, and newlines, since none of those
-# are in the class — bash's `=~` with an anchored ^...$ pattern cannot
-# match past an embedded newline it doesn't allow, so multi-line injection
-# attempts are rejected by the same check). '@' and "'" are explicitly
-# allowed — confirmed safe against real `visudo -cf` — because real AD
-# environments routinely have UPN-style usernames (user@domain.com) and
-# names containing an apostrophe (O'Brien); rejecting those outright would
-# just be a second, quieter way to fail a legitimate operator.
+# Allowlist, not denylist: must start alphanumeric/dot/underscore, then only
+# alphanumerics, dots, underscores, spaces, hyphens, '@' or "'". That blocks
+# '#', '=', '(', ')', ':', quotes, backslashes and newlines. '@' and "'" are
+# allowed on purpose — UPN usernames and names like O'Brien are legitimate.
 _is_safe_ad_identifier() {
     [[ "$1" =~ ^[A-Za-z0-9._][A-Za-z0-9._\ @\'-]*$ ]]
 }
 
-# CC-175 security fix (round 2): a single sudo-username field additionally
-# must not be the bare word "ALL" or contain a space. "ALL" is a sudoers
-# reserved keyword meaning "every user" in the User_List position — it's
-# 3 plain letters, so it passes _is_safe_ad_identifier's character
-# allowlist untouched, and the resulting line "ALL ALL=(ALL:ALL) ALL" is
-# valid sudoers syntax that grants every account on the box passwordless
-# root. Confirmed exploitable against real visudo. A single username also
-# has no legitimate reason to contain a space (unlike a group name or a
-# space-separated user LIST, which still only need _is_safe_ad_identifier).
+# _is_safe_ad_identifier only anchors the FIRST character of the whole
+# string, so a value like "alice -w" passes it (the leading '-' check does
+# not apply to later whitespace-separated tokens) and then splits into a
+# flag argument when word-split unquoted into `realm permit $AD_PERMIT_USERS`.
+# Used alongside _is_safe_ad_identifier wherever that value is a
+# space-separated list, not a single field.
+_has_flaglike_token() {
+    local tok
+    for tok in $1; do
+        [[ "$tok" == -* ]] && return 0
+    done
+    return 1
+}
+
+# SECURITY: a single sudo-username field must additionally not be "ALL" or
+# contain a space. "ALL" passes the character allowlist but is a sudoers
+# keyword meaning every user, so "ALL ALL=(ALL:ALL) ALL" would grant the
+# whole box root. Group names and space-separated user lists are exempt and
+# only need _is_safe_ad_identifier.
 _is_safe_sudo_username() {
     local val="$1"
     _is_safe_ad_identifier "$val" || return 1
@@ -404,15 +329,10 @@ _is_safe_sudo_username() {
     return 0
 }
 
-# Only called when AD_BARE_USERNAMES is enabled (see
-# _configure_sssd_login_format and its call site) — when sssd is being
-# configured for bare-username logins, the character allowlist above still
-# technically accepts '@', so a qualified "user@domain" value would
-# otherwise pass validation silently and end up written into sudoers
-# verbatim, where it would never match a bare-username login: a silent,
-# non-functional sudo grant. Strip a trailing "@domain" and warn instead
-# of accepting it quietly, so the sudoers entry always matches what the
-# operator will actually type at login.
+# Only called when AD_BARE_USERNAMES is enabled. The allowlist above accepts
+# '@', so a qualified "user@domain" would land in sudoers verbatim and never
+# match a bare-username login — a silent, non-functional sudo grant. Strip
+# the suffix and warn so sudoers matches what the operator actually types.
 _strip_ad_domain_suffix() {
     local val="$1"
     if [[ "$val" == *@* ]]; then
@@ -426,7 +346,6 @@ _strip_ad_domain_suffix() {
 ip_to_int() {
     local ip="$1" a b c d
     IFS=. read -r a b c d <<< "$ip"
-    # Validate all four octets are 0-255 numerics
     local octet
     for octet in "$a" "$b" "$c" "$d"; do
         [[ "$octet" =~ ^[0-9]+$ ]] || { echo ""; return 1; }
@@ -435,7 +354,7 @@ ip_to_int() {
     echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
 }
 
-# P0: Validate that the chosen GATEWAY lives inside STATIC_IP/NETMASK_CIDR.
+# Validate that the chosen GATEWAY lives inside STATIC_IP/NETMASK_CIDR.
 # Uses pure bash arithmetic — no ipcalc / ipset dependency. Exits non-zero
 # with a clear error if the gateway is outside the subnet.
 validate_gateway_in_subnet() {
@@ -467,7 +386,6 @@ validate_gateway_in_subnet() {
     return 0
 }
 
-# Cleanup function to be executed on script exit
 cleanup() {
     local rc=$?
     echo ""
@@ -486,7 +404,6 @@ cleanup() {
     # collected before an interrupt.
     unset -v AD_PASSWORD AD_DOMAIN AD_USER 2>/dev/null || true
     echo -e "${GREEN}[OK]${NC} Cleanup complete."
-    # Revert terminal colors
     echo -e "${NC}\033[0m"
     echo "===== TUBSS run ended rc=${rc} ====="
     # Flush the log pipeline: close stdout/stderr and wait for the tee subshell
@@ -498,15 +415,9 @@ cleanup() {
     fi
 }
 
-# --- Set traps for error handling and cleanup ---
-# Trap the ERR signal to call our handle_error function
 trap 'handle_error' ERR
-# Trap the EXIT signal to call our cleanup function
 trap 'cleanup' EXIT
 
-# --- Main script starts here ---
-
-# Print usage / help text. No root required.
 print_usage() {
     cat << 'USAGE'
 TUBSS — The Ubuntu/Debian Basic Setup Script
@@ -670,15 +581,15 @@ parse_args() {
     done
 }
 
-# P3: route stdout+stderr through a tee to /var/log/tubss.log with timestamps.
+# Route stdout+stderr through a tee to /var/log/tubss.log with timestamps.
 # Falls back to /tmp/tubss.log if the primary path isn't writable. Skipped
 # when TUBSS_NO_LOG=1 to keep dry-run / help fast and side-effect-free.
 setup_logging() {
     [[ ${TUBSS_NO_LOG:-0} -eq 1 ]] && { TUBSS_TTY=$([[ -t 1 ]] && echo 1 || echo 0); export TUBSS_TTY; return 0; }
     local log=/var/log/tubss.log
     if ! ( : >> "$log" ) 2>/dev/null; then log="/tmp/tubss.log"; fi
-    # CC-175: the log now records the AD domain and admin username (never the
-    # password) alongside everything else TUBSS does — keep it root-only.
+    # The log records the AD domain and admin username (never the password),
+    # so keep it root-only.
     chmod 600 "$log" 2>/dev/null || true
     TUBSS_TTY=$([[ -t 1 ]] && echo 1 || echo 0)
     export TUBSS_TTY
@@ -688,44 +599,22 @@ setup_logging() {
     echo "===== TUBSS run started $(date -Is) pid=$$ version=${TUBSS_SCRIPT_VERSION} argv=$* ====="
 }
 
-# CC-123 / CC-128 / CC-133: prompt() — show an interactive prompt on the user's TTY.
-#
-# setup_logging() redirects stdout+stderr through a line-buffered subshell
-# pipe so the full run is captured in /var/log/tubss.log. `read -p` writes
-# its prompt to stderr WITHOUT a trailing newline, which the pipe buffers
-# indefinitely — users see nothing and the script looks hung. Writing to
-# /dev/tty bypasses the pipe and restores interactive behavior.
-#
-# CC-128: /dev/tty writes are unbuffered but the log-pipe subshell is async,
-# so recent stdout lines can arrive AFTER the prompt appears. `_flush_log()`
-# briefly sleeps to let the tee subshell drain its buffer before we paint the
-# prompt. Note: this is a BEST-EFFORT ordering aid (cosmetic) — there's no
-# guaranteed drain; on a loaded VM with heavy prior output, a stray log line
-# may still land after the prompt. The operator's choices remain captured
-# via the summary table, which is the canonical audit record.
-#
-# CC-133 audit note: prompt *text* is NOT captured in /var/log/tubss.log
-# because /dev/tty bypasses the log pipe entirely. This is intentional —
-# the summary table at end-of-run is the source of truth for what the
-# operator chose. If you need a fuller audit trail, log the chosen values
-# explicitly after each prompt.
-#
-# Note: IFS is NOT cleared, to match the whitespace-trimming behavior of the
-# plain `read -p` calls that were migrated — free-text prompts (AD domain,
-# custom rule descriptions) should not silently accept leading/trailing spaces.
+# Shows an interactive prompt on /dev/tty, bypassing setup_logging()'s
+# line-buffered pipe (which would otherwise swallow read -p's no-newline
+# prompt text until the script looked hung). _flush_log() gives the async
+# log subshell a moment to drain first so output doesn't land after the
+# prompt (best-effort, not guaranteed). Prompt text itself is intentionally
+# not captured in the log — the end-of-run summary table is the audit
+# record of what the operator chose.
 #
 # Usage: prompt VARNAME "Prompt text: "
 
-# Internal: give the async tee subshell a moment to flush pending output
-# before the next prompt is painted on /dev/tty. BEST-EFFORT — not a
-# guaranteed drain. See prompt()'s header comment.
 _flush_log() {
     sleep 0.05 2>/dev/null || true
 }
 
-# Internal: guard against callers passing a `__`-prefixed varname that
-# would collide with the helper's internal locals (`__varname`, `__text`).
-# All existing callers use unprefixed names; this protects future callers.
+# A `__`-prefixed varname from a caller would collide with the helper's own
+# locals (`__varname`, `__text`).
 _prompt_validate_varname() {
     local name="$1"
     if [[ "$name" =~ ^__ ]]; then
@@ -745,21 +634,16 @@ prompt() {
         # shellcheck disable=SC2229
         read -r "$__varname" < /dev/tty
     else
-        # No /dev/tty available. Under setup_logging() the fallback would
-        # have the SAME bug as raw `read -p` (prompt stuck in tee buffer
-        # forever). Refuse rather than silently hang. main() already
-        # enforces stdin-TTY in interactive mode, so this should never
-        # fire in production — it's defensive only.
+        # No /dev/tty: a stdout fallback would sit in the tee buffer
+        # forever, so refuse rather than silently hang.
         echo "[FATAL] prompt(): /dev/tty is not writable — cannot prompt interactively." >&2
         echo "[FATAL] Run with --unattended (skips prompts) or from a real terminal." >&2
         exit 3
     fi
 }
 
-# CC-123 / CC-128 / CC-133: prompt_secret() — silent (no-echo) variant for passwords.
-# Same /dev/tty-bypass and flush rationale; adds `-s` so the keystrokes are
-# not echoed. Prints a trailing newline after input since `-s` suppresses
-# the user's Enter.
+# No-echo variant for passwords. Same /dev/tty rationale as prompt(); the
+# trailing newline is manual because `-s` swallows the user's Enter.
 #
 # Usage: prompt_secret VARNAME "Password: "
 prompt_secret() {
@@ -779,7 +663,7 @@ prompt_secret() {
     fi
 }
 
-# P5: detect OS from /etc/os-release and populate distro-specific globals.
+# Detect OS from /etc/os-release and populate distro-specific globals.
 detect_os() {
     # shellcheck disable=SC1091
     if [[ -r /etc/os-release ]]; then
@@ -793,14 +677,10 @@ detect_os() {
         DETECTED_CODENAME="unknown"
     fi
 
-    # Debian's testing/unstable suites often don't set VERSION_ID until the
-    # release freezes close to stable — confirmed empirically against a live
-    # debian:testing image: VERSION_CODENAME=forky, VERSION_ID entirely
-    # absent. Without this fallback, DETECTED_VERSION stays "unknown" on
-    # that release, which silently defeats both the SUPPORTED_VERSIONS check
-    # and the DEBIAN_TESTING_TIER warning below (Debian 14 support would
-    # never actually engage in practice, only in principle). Extend this
-    # case statement as later testing-suite codenames replace "forky".
+    # Debian testing/unstable omits VERSION_ID until the release freezes, so
+    # without this fallback DETECTED_VERSION stays "unknown" and silently
+    # defeats both the SUPPORTED_VERSIONS check and DEBIAN_TESTING_TIER.
+    # Extend as later testing codenames replace "forky".
     if [[ "$DETECTED_OS" == "debian" && "$DETECTED_VERSION" == "unknown" ]]; then
         case "$DETECTED_CODENAME" in
             forky) DETECTED_VERSION="14" ;;
@@ -826,7 +706,6 @@ detect_os() {
     esac
 }
 
-# Check for root privileges
 main() {
     parse_args "$@"
 
@@ -855,10 +734,9 @@ main() {
         TUBSS_NO_LOG=1
     fi
 
-    # CC-104 Fix B: Guard against curl|bash / no-TTY invocations in interactive
-    # mode. --unattended is allowed (uses defaults, no prompts needed). Without
-    # a TTY, `read -p` prompts silently take defaults (or loop forever on
-    # validated inputs) — refuse loudly rather than ship a half-configured box.
+    # Guard against curl|bash / no-TTY invocations in interactive mode:
+    # without a TTY, prompts silently take defaults or loop forever, so
+    # refuse loudly rather than ship a half-configured box.
     if [[ ${TUBSS_UNATTENDED:-0} -ne 1 ]] && [[ ! -t 0 ]]; then
         echo -e "${RED}[ERROR]${NC} TUBSS requires an interactive TTY for configuration prompts." >&2
         echo -e "${RED}[ERROR]${NC} Don't run via 'curl | bash'. Download first, then execute:" >&2
@@ -871,11 +749,9 @@ main() {
     setup_logging "$@"
     detect_os
 
-    # Change terminal colors
     echo -e "${NC}" # Reset first
     [[ ${TUBSS_TTY:-1} -eq 1 ]] && clear
 
-    # Display banner art and system info
     echo -e "$BANNER_ART"
     echo -e "--------------------------------------------------------"
 
@@ -981,7 +857,7 @@ run_prereqs() {
         echo -e "${YELLOW}[WARN]${NC} ${_pretty_os} ${DETECTED_VERSION} is not officially supported. Tested versions: ${SUPPORTED_VERSIONS[*]}"
         echo -e "${YELLOW}[WARN]${NC} Proceeding anyway — some features may not work correctly."
     else
-        echo -e "${GREEN}[OK]${NC} ${_pretty_os} ${DETECTED_VERSION} detected — fully supported"
+        echo -e "${GREEN}[OK]${NC} ${_pretty_os} ${DETECTED_VERSION} detected — fully supported."
     fi
 
     # Get the original user's desktop path for the summary file
@@ -995,9 +871,13 @@ run_prereqs() {
     SUMMARY_FILE="$DESKTOP_DIR/tubss_configuration_summary_$(date +%Y%m%d_%H%M%S).txt"
 
     # Capture Before Values
-    # P1: headless/no-IP hosts produce empty pipes — guard with `|| true` and
+    # Headless/no-IP hosts produce empty pipes — guard with `|| true` and
     # fall back to "0.0.0.0" so set -u downstream stays safe.
-    ORIGINAL_IP_CIDR=$(ip -o -4 a 2>/dev/null | awk '{print $4}' | grep -v 'lo' | head -n 1 || true)
+    # Exclude the interface by name (field 2) before reducing to the address
+    # (field 4) — filtering the address string itself for "lo" never matches
+    # (an address like 127.0.0.1/8 doesn't contain "lo"), so loopback was
+    # never actually excluded and would win via `head -n 1` on most hosts.
+    ORIGINAL_IP_CIDR=$(ip -o -4 a 2>/dev/null | awk '$2 != "lo" {print $4}' | head -n 1 || true)
     ORIGINAL_NETMASK_DETECTED=1
     if [[ -z "${ORIGINAL_IP_CIDR:-}" ]]; then
         ORIGINAL_IP="0.0.0.0"
@@ -1103,12 +983,8 @@ get_user_configuration() {
         CONFIG_CHOICE=$(echo "$CONFIG_CHOICE" | tr '[:upper:]' '[:lower:]')
     fi
 
-    # Verbose display is a display preference, not a system-config choice,
-    # but it affects how readable the WHOLE run is -- ask it once, up
-    # front, rather than expecting the operator to already know about
-    # --verbose/TUBSS_VERBOSE before starting. "default" mode skips this
-    # (its whole point is fast, no-questions-asked setup); can still be set
-    # via --verbose or TUBSS_VERBOSE=1 either way.
+    # Asked up front so the operator doesn't have to know --verbose/TUBSS_VERBOSE
+    # beforehand. Skipped in "default" mode, which is meant to be question-free.
     if [[ "$CONFIG_CHOICE" == "manual" ]] && (( TUBSS_VERBOSE != 1 )); then
         local _verbose_choice
         prompt _verbose_choice "Show real command output instead of a progress spinner? (yes/no) [no]: "
@@ -1124,11 +1000,9 @@ get_user_configuration() {
     echo ""
 
     # Filesystem Snapshot
-    # "pending", not "Not Applicable" -- this runs before
-    # show_summary_and_confirm(), and snapshot_summary_value() treats
-    # "pending" as "not decided/run yet, show intent (CREATE_SNAPSHOT)
-    # instead". "Not Applicable" here made the confirmation table show
-    # that instead of the operator's actual yes/no choice.
+    # Must be "pending", not "Not Applicable": this runs before
+    # show_summary_and_confirm(), and snapshot_summary_value() only shows the
+    # operator's CREATE_SNAPSHOT intent while the status is "pending".
     SNAPSHOT_STATUS="pending"
     CREATE_SNAPSHOT="no" # Default to no
     if command -v timeshift &> /dev/null; then
@@ -1281,10 +1155,8 @@ get_user_configuration() {
         INSTALL_NFS="yes"
         INSTALL_SMB="yes"
         INSTALL_GIT="yes"
-        # SSH hardening stays OFF in default / unattended mode to avoid
-        # silent SSH lockout. Users must opt in via manual mode OR by
-        # pre-seeding SSH_HARDENING=yes in the environment (documented
-        # opt-in for integration tests / automation).
+        # SSH hardening stays OFF in default/unattended mode to avoid silent
+        # SSH lockout. Opt in via manual mode or by pre-seeding SSH_HARDENING=yes.
         if [[ "${SSH_HARDENING:-}" == "yes" ]]; then
             SSH_HARDENING="yes"
             SSH_DISABLE_PW_AUTH="${SSH_DISABLE_PW_AUTH:-yes}"
@@ -1310,15 +1182,10 @@ get_user_configuration() {
         else
             ENABLE_MOTD_BANNER="no"
         fi
-        # AD domain join (CC-175) stays OFF in default/unattended mode for
-        # the same reason — same opt-in pattern as SSH_HARDENING above.
-        # AD_DOMAIN/AD_USER/AD_PASSWORD/AD_PERMIT_MODE/AD_GRANT_ADMINS_SUDO/
-        # AD_SUDO_EXTRA_USER/AD_BARE_USERNAMES must ALSO be pre-seeded; none of them are
-        # prompted for in this branch (see the CONFIG_CHOICE=="default"
-        # short-circuit further down, right before the AD prompts) since no
-        # /dev/tty is guaranteed to exist in unattended automation and
-        # prompt()/prompt_secret() intentionally fatal-exit rather than hang
-        # or silently read garbage when one isn't available.
+        # AD domain join stays OFF in default/unattended mode, same opt-in
+        # pattern as SSH_HARDENING. All AD_* settings must also be pre-seeded:
+        # this branch never prompts, because unattended runs may have no
+        # /dev/tty and prompt()/prompt_secret() fatal-exit rather than hang.
         if [[ "${JOIN_DOMAIN:-}" == "yes" ]]; then
             JOIN_DOMAIN="yes"
         else
@@ -1333,20 +1200,20 @@ get_user_configuration() {
         ENABLE_AUTO_UPDATES=${ENABLE_AUTO_UPDATES:-yes}
         if [[ "$ENABLE_AUTO_UPDATES" =~ ^([yY][eE][sS]|[yY])$ ]]; then
             echo -e "${YELLOW}Some servers need to stay up until a human approves a reboot — leave this off if that's you.${NC}"
-            prompt AUTO_REBOOT_UPDATES "Automatically reboot when a security update requires it (e.g. a new kernel)? (yes/no) [no]: "
+            prompt AUTO_REBOOT_UPDATES "Do you want to automatically reboot when a security update requires it (e.g., a new kernel)? (yes/no) [no]: "
             AUTO_REBOOT_UPDATES=${AUTO_REBOOT_UPDATES:-no}
         else
             AUTO_REBOOT_UPDATES="no"
         fi
-        prompt ENABLE_MOTD_BANNER "Show a standard authorized-access-only warning banner at login? (yes/no) [no]: "
+        prompt ENABLE_MOTD_BANNER "Do you want to show a standard authorized-access-only warning banner at login? (yes/no) [no]: "
         ENABLE_MOTD_BANNER=${ENABLE_MOTD_BANNER:-no}
         prompt INSTALL_FAIL2BAN "Do you want to install Fail2ban? (yes/no) [yes]: "
         INSTALL_FAIL2BAN=${INSTALL_FAIL2BAN:-yes}
         prompt DISABLE_TELEMETRY "Do you want to disable optional telemetry and analytics? (yes/no) [yes]: "
         DISABLE_TELEMETRY=${DISABLE_TELEMETRY:-yes}
 
-        # SSH hardening (CC-104) — opt-in, default N. Only in manual mode.
-        prompt SSH_HARDENING "Enable SSH hardening (sshd_config tightening)? (yes/no) [no]: "
+        # SSH hardening — opt-in, default no. Manual mode only.
+        prompt SSH_HARDENING "Do you want to enable SSH hardening (sshd_config tightening)? (yes/no) [no]: "
         SSH_HARDENING=${SSH_HARDENING:-no}
         SSH_HARDENING=$(echo "$SSH_HARDENING" | tr '[:upper:]' '[:lower:]')
         if [[ "$SSH_HARDENING" =~ ^([yY][eE][sS]|[yY])$ ]]; then
@@ -1377,10 +1244,8 @@ get_user_configuration() {
             JOIN_DOMAIN=${JOIN_DOMAIN:-no}
         fi
 
-        # CC-176: wording says "packages" deliberately, not "install and
-        # configure" — this installs nfs-common/cifs-utils only, it does
-        # not set up any mounts or /etc/fstab entries. The old wording
-        # over-promised.
+        # Wording says "packages" deliberately: this installs
+        # nfs-common/cifs-utils only, no mounts or /etc/fstab entries.
         prompt INSTALL_NFS "Do you want to install the NFS Client packages? (yes/no) [yes]: "
         INSTALL_NFS=${INSTALL_NFS:-yes}
         prompt INSTALL_SMB "Do you want to install the SMB Client packages? (yes/no) [yes]: "
@@ -1404,16 +1269,13 @@ get_user_configuration() {
 
 
     # AD details if requested. AD_DOMAIN / AD_USER / AD_PASSWORD are consumed
-    # by join_ad_domain() (CC-175), which scrubs all three once the join has
-    # been attempted; cleanup() scrubs them again on any early exit.
+    # by join_ad_domain(), which scrubs all three once the join has been
+    # attempted; cleanup() scrubs them again on any early exit.
     if [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]] && [[ "$CONFIG_CHOICE" == "default" ]]; then
-        # Unattended/default mode: never call prompt()/prompt_secret() here —
-        # no /dev/tty is guaranteed to exist, and those helpers deliberately
-        # fatal-exit rather than hang when one isn't available (CC-123).
-        # AD_DOMAIN/AD_USER/AD_PASSWORD must already be pre-seeded in the
-        # environment; if they weren't, perform_realm_join()'s own guard
-        # reports "Failed (incomplete credentials)" and the run continues
-        # rather than crashing here on empty required values.
+        # Unattended/default mode: never prompt here — no /dev/tty is guaranteed
+        # and the prompt helpers fatal-exit rather than hang. Credentials must be
+        # pre-seeded; if they aren't, perform_realm_join()'s guard reports
+        # "Failed (incomplete credentials)" and the run continues.
         AD_PERMIT_MODE=$(echo "${AD_PERMIT_MODE:-all}" | tr '[:upper:]' '[:lower:]')
         case "$AD_PERMIT_MODE" in
             a|all) AD_PERMIT_MODE="a" ;;
@@ -1423,17 +1285,15 @@ get_user_configuration() {
         esac
         AD_GRANT_ADMINS_SUDO=$(echo "${AD_GRANT_ADMINS_SUDO:-yes}" | tr '[:upper:]' '[:lower:]')
         AD_BARE_USERNAMES=$(echo "${AD_BARE_USERNAMES:-yes}" | tr '[:upper:]' '[:lower:]')
-        # Pre-seeded env values skip every interactive validation loop above,
-        # so re-check them here — apply_realm_permit()/install_ad_sudoers()
-        # would also catch an unsafe value at time of use, but failing here
-        # gives a clear reason at config-review time instead of a run-time
-        # surprise. See _is_safe_ad_identifier's header for what/why.
+        # Pre-seeded env values skip the interactive validation loops, so
+        # re-check them here — surfacing a bad value at config-review time
+        # rather than mid-run. See _is_safe_ad_identifier for the rules.
         if [[ "$AD_PERMIT_MODE" == "g" ]] && ! _is_safe_ad_identifier "${AD_PERMIT_GROUP:-}"; then
             echo -e "  ${YELLOW}[WARN]${NC} AD_PERMIT_GROUP is empty or contains unsafe characters — falling back to 'all domain users'."
             AD_PERMIT_MODE="a"
         fi
-        if [[ "$AD_PERMIT_MODE" == "u" ]] && ! _is_safe_ad_identifier "${AD_PERMIT_USERS:-}"; then
-            echo -e "  ${YELLOW}[WARN]${NC} AD_PERMIT_USERS is empty or contains unsafe characters — falling back to 'all domain users'."
+        if [[ "$AD_PERMIT_MODE" == "u" ]] && { ! _is_safe_ad_identifier "${AD_PERMIT_USERS:-}" || _has_flaglike_token "${AD_PERMIT_USERS:-}"; }; then
+            echo -e "  ${YELLOW}[WARN]${NC} AD_PERMIT_USERS is empty, contains unsafe characters, or has a username starting with '-' — falling back to 'all domain users'."
             AD_PERMIT_MODE="a"
         fi
         if [[ -n "${AD_SUDO_EXTRA_USER:-}" ]] && [[ "$AD_BARE_USERNAMES" =~ ^([yY][eE][sS]|[yY])$ ]]; then
@@ -1444,11 +1304,8 @@ get_user_configuration() {
             AD_SUDO_EXTRA_USER=""
         fi
     elif [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        # AD_DOMAIN/AD_USER predate the permit/sudo fields above and never
-        # got the same validation — a value like "--help" would otherwise
-        # pass straight through as an unintended flag to `realm` (argument
-        # injection; low severity, but the same class of gap, so closing it
-        # for consistency).
+        # Validate AD_DOMAIN/AD_USER: a value like "--help" would otherwise pass
+        # straight through to `realm` as a flag (argument injection).
         while true; do
             prompt AD_DOMAIN "Enter the Active Directory domain name (e.g., corp.example.com): "
             if [[ -n "$AD_DOMAIN" ]] && _is_safe_ad_identifier "$AD_DOMAIN"; then
@@ -1468,18 +1325,13 @@ get_user_configuration() {
         echo -e "${YELLOW}Not displayed as you type.${NC}"
         prompt_secret AD_PASSWORD "Enter the password for that account: "
 
-        # Who may log in once the box is joined. A bare `realm join` leaves
-        # realmd at its PERMIT-ALL default, so "every domain user can log in"
-        # is what you get whether or not you thought about it. TUBSS keeps
-        # that as the default (this is a homelab join, not a bastion) but
-        # makes it a deliberate, recorded choice instead of an accident.
+        # Who may log in once joined. A bare `realm join` leaves realmd at its
+        # PERMIT-ALL default; TUBSS keeps that default but makes it an explicit,
+        # recorded choice rather than an accident.
         echo -e "${YELLOW}Default is everyone in the domain, matching how most homelab/office AD setups already work — restrict below only if you want it narrower (separate from sudo, asked next).${NC}"
         while true; do
-            # Full words to match every other multi-choice prompt in this
-            # script (CONFIG_CHOICE, NET_TYPE); the single letters still work
-            # too since that's what the internal AD_PERMIT_MODE value is
-            # normalized to below, and downstream code only ever compares
-            # against 'a'/'g'/'u'.
+            # Full words to match the other multi-choice prompts; single
+            # letters also work since the value is normalized to 'a'/'g'/'u'.
             prompt AD_PERMIT_MODE "Allow login for all domain users, a specific group, or specific user(s)? (all/group/user) [all]: "
             AD_PERMIT_MODE=${AD_PERMIT_MODE:-all}
             AD_PERMIT_MODE=$(echo "$AD_PERMIT_MODE" | tr '[:upper:]' '[:lower:]')
@@ -1492,7 +1344,7 @@ get_user_configuration() {
         done
         if [[ "$AD_PERMIT_MODE" == "g" ]]; then
             while true; do
-                prompt AD_PERMIT_GROUP "Enter the domain group to permit (e.g. 'Domain Admins'): "
+                prompt AD_PERMIT_GROUP "Enter the domain group to permit (e.g., 'Domain Admins'): "
                 if [[ -z "$AD_PERMIT_GROUP" ]]; then
                     echo -e "${RED}A group name is required. Enter one, or re-run and choose 'all' for all domain users.${NC}"
                 elif ! _is_safe_ad_identifier "$AD_PERMIT_GROUP"; then
@@ -1508,30 +1360,29 @@ get_user_configuration() {
                     echo -e "${RED}At least one username is required. Enter one, or re-run and choose 'all' for all domain users.${NC}"
                 elif ! _is_safe_ad_identifier "$AD_PERMIT_USERS"; then
                     echo -e "${RED}Only letters, digits, spaces, dots, underscores, and hyphens are allowed. Please re-enter.${NC}"
+                elif _has_flaglike_token "$AD_PERMIT_USERS"; then
+                    echo -e "${RED}No username may start with '-'. Please re-enter.${NC}"
                 else
                     break
                 fi
             done
         fi
 
-        # Bare-username logins (no @domain suffix needed at login/id/sudo).
-        # Opt-out default yes: it's what most people expect, but it IS a
-        # real edit to sssd.conf on a live auth path, so it's asked rather
-        # than forced. See _configure_sssd_login_format's header for detail.
-        prompt AD_BARE_USERNAMES "Configure sssd so domain users sign in with just their username (no '@${AD_DOMAIN:-domain}' suffix needed)? (yes/no) [yes]: "
+        # Bare-username logins (no @domain suffix at login/id/sudo). Defaults
+        # to yes but is asked, since it edits sssd.conf on a live auth path.
+        # See _configure_sssd_login_format's header for detail.
+        prompt AD_BARE_USERNAMES "Do you want to configure sssd so domain users sign in with just their username (no '@${AD_DOMAIN:-domain}' suffix needed)? (yes/no) [yes]: "
         AD_BARE_USERNAMES=${AD_BARE_USERNAMES:-yes}
         AD_BARE_USERNAMES=$(echo "$AD_BARE_USERNAMES" | tr '[:upper:]' '[:lower:]')
 
-        # Sudo for domain accounts. "Domain Admins" is the AD group that
-        # already implies full administrative authority, so granting it sudo
-        # is the expected default; the extra-user prompt covers the common
-        # "and my own account too" case.
-        prompt AD_GRANT_ADMINS_SUDO "Grant sudo to the 'Domain Admins' group by default? (yes/no) [yes]: "
+        # Sudo for domain accounts. "Domain Admins" already implies full
+        # administrative authority, so granting it sudo is the expected default.
+        prompt AD_GRANT_ADMINS_SUDO "Do you want to grant sudo to the 'Domain Admins' group by default? (yes/no) [yes]: "
         AD_GRANT_ADMINS_SUDO=${AD_GRANT_ADMINS_SUDO:-yes}
         AD_GRANT_ADMINS_SUDO=$(echo "$AD_GRANT_ADMINS_SUDO" | tr '[:upper:]' '[:lower:]')
         local _sudo_extra_prompt
         if [[ "$AD_BARE_USERNAMES" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-            _sudo_extra_prompt="Additionally grant sudo to one specific domain username — bare username, e.g. 'jsmith' (optional, leave blank to skip): "
+            _sudo_extra_prompt="Additionally grant sudo to one specific domain username — bare username, e.g., 'jsmith' (optional, leave blank to skip): "
         else
             _sudo_extra_prompt="Additionally grant sudo to one specific domain username — enter it in whatever format sssd will resolve at login (optional, leave blank to skip): "
         fi
@@ -1565,7 +1416,7 @@ collect_custom_ufw_rules() {
             break
         fi
 
-        prompt add_rule "Add a custom firewall rule? (yes/no) [no]: "
+        prompt add_rule "Do you want to add a custom firewall rule? (yes/no) [no]: "
         add_rule=${add_rule:-no}
         add_rule=$(echo "$add_rule" | tr '[:upper:]' '[:lower:]')
 
@@ -1625,16 +1476,11 @@ collect_custom_ufw_rules() {
 }
 
 # --- Shared Summary Display ---
-# CC-175: the "AD Domain Join" row is rendered twice (configuration review
-# before execution, final summary after). Before join_ad_domain() runs,
-# AD_JOIN_STATUS is still "pending" and the row shows the intent
-# (NEW_DOMAIN_SUMMARY = "To be Joined"/"Skipped"); afterwards it shows the
-# real outcome.
-# Same pre/post trick for SSH hardening: before configure_ssh_hardening()
-# runs, SSH_HARDENING_STATUS is still "pending" and the row shows intent
-# (NEW_SSH_HARDENING_SUMMARY). Afterwards it shows the real outcome — this
-# matters because a CC-181 sshd -t validation failure rolls back silently
-# otherwise, and the report would keep claiming hardening was applied.
+# The summary table is rendered twice (configuration review before execution,
+# final summary after). While a *_STATUS is still "pending" the row shows the
+# operator's intent (NEW_*_SUMMARY); afterwards it shows the real outcome. For
+# SSH hardening that distinction matters: an `sshd -t` validation failure rolls
+# the config back, and a static row would keep claiming hardening was applied.
 snapshot_summary_value() {
     if [[ "${SNAPSHOT_STATUS:-pending}" == "pending" ]]; then
         echo "${CREATE_SNAPSHOT}"
@@ -1659,10 +1505,8 @@ ad_join_summary_value() {
     fi
 }
 
-# Same pre/post rendering trick for "who may log in" and "who gets sudo".
-# Both are materially more important than the join itself — a successful
-# join that permitted nobody is a box no one can use — so they get their own
-# rows rather than being buried in the log.
+# "Who may log in" and "who gets sudo" get their own rows: a successful join
+# that permitted nobody is a box no one can use.
 ad_permit_summary_value() {
     if [[ "${AD_PERMIT_STATUS:-pending}" == "pending" ]]; then
         echo "${NEW_AD_PERMIT_SUMMARY}"
@@ -1679,11 +1523,9 @@ ad_sudo_summary_value() {
     fi
 }
 
-# Whether NSS/sssd actually resolves a real identity post-join — a
-# stronger, more honest signal than AD_JOIN_STATUS alone. Gets its own row
-# for the same reason permit/sudo do: a "Joined" box nobody can actually
-# log into is not a working box, and burying that in a [WARN] log line
-# a few screens up is exactly how it goes unnoticed.
+# Whether NSS/sssd actually resolves a real identity post-join — a stronger
+# signal than AD_JOIN_STATUS alone, since a "Joined" box nobody can log into
+# is not a working box.
 ad_identity_summary_value() {
     if [[ "${AD_IDENTITY_STATUS:-pending}" == "pending" ]]; then
         echo "${NEW_AD_IDENTITY_SUMMARY}"
@@ -1708,26 +1550,24 @@ display_config_summary() {
     printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "UFW Firewall Status:" "${NC}" "${ORIGINAL_UFW_STATUS}" "${NEW_UFW_SUMMARY}"
     local custom_rule_count="${#CUSTOM_UFW_RULES[@]}"
     if (( custom_rule_count > 0 )); then
-        printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Custom UFW Rules:" "${NC}" "none" "${custom_rule_count} custom rules"
+        printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Custom UFW Rules:" "${NC}" "N/A" "${custom_rule_count} custom rules"
     else
-        printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Custom UFW Rules:" "${NC}" "none" "none"
+        printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Custom UFW Rules:" "${NC}" "N/A" "none"
     fi
     printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Auto Updates Status:" "${NC}" "${ORIGINAL_AUTO_UPDATES_STATUS}" "${NEW_AUTO_UPDATES_SUMMARY}"
     printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Auto Reboot on Update:" "${NC}" "${ORIGINAL_AUTO_REBOOT_STATUS}" "${NEW_AUTO_REBOOT_SUMMARY}"
     printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Login Banner (MOTD):" "${NC}" "${ORIGINAL_MOTD_STATUS}" "${NEW_MOTD_SUMMARY}"
-    # CC-133: "Package Updates" row — show "pending" pre-execution; updated
-    # to "Applied" or "Partial (upgrade failed, continuing)" post-upgrade.
-    # This table is shown both before execution (configuration review) and
-    # after (final summary), so PACKAGE_UPDATES_STATUS tracks both states.
-    local _pkg_before _pkg_after
+    # "Package Updates" row — "pending" pre-execution, then "Applied" or
+    # "Partial (upgrade failed, continuing)" once the upgrade has run.
+    local _pkg_after
     if [[ "$PACKAGE_UPDATES_STATUS" == "pending" ]]; then
-        _pkg_before="pending"; _pkg_after="To be Applied"
+        _pkg_after="To be Applied"
     else
-        _pkg_before="pending"; _pkg_after="$PACKAGE_UPDATES_STATUS"
+        _pkg_after="$PACKAGE_UPDATES_STATUS"
     fi
-    printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Package Updates:" "${NC}" "${_pkg_before}" "${_pkg_after}"
+    printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Package Updates:" "${NC}" "N/A" "${_pkg_after}"
     printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Fail2ban Status:" "${NC}" "${ORIGINAL_FAIL2BAN_STATUS}" "${NEW_FAIL2BAN_SUMMARY}"
-    printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "SSH Hardening:" "${NC}" "default" "$(ssh_hardening_summary_value)"
+    printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "SSH Hardening:" "${NC}" "N/A" "$(ssh_hardening_summary_value)"
     printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "Telemetry/Analytics:" "${NC}" "${ORIGINAL_TELEMETRY_STATUS}" "${NEW_TELEMETRY_SUMMARY}"
     printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "AD Domain Join:" "${NC}" "${ORIGINAL_DOMAIN_STATUS:-Not Joined}" "$(ad_join_summary_value)"
     printf "%b%-30s%b | %-20s | %-20s\n" "${YELLOW}" "AD Login Permitted:" "${NC}" "N/A" "$(ad_permit_summary_value)"
@@ -1745,10 +1585,8 @@ show_summary_and_confirm() {
     NEW_WEBMIN_SUMMARY=$(if [[ "$INSTALL_WEBMIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
     NEW_UFW_SUMMARY=$(if [[ "$ENABLE_UFW" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Enabled"; else echo "Skipped"; fi)
     NEW_AUTO_UPDATES_SUMMARY=$(if [[ "$ENABLE_AUTO_UPDATES" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Enabled"; else echo "Skipped"; fi)
-    # Own row, not a suffix on Auto Updates Status above — a server
-    # rebooting itself unattended is consequential enough to be its own
-    # visible line (same reasoning as why AD Permit/Sudo/Identity each got
-    # their own row instead of being folded into "AD Domain Join").
+    # Own row, not a suffix on Auto Updates Status — a server rebooting itself
+    # unattended is consequential enough to be its own visible line.
     NEW_AUTO_REBOOT_SUMMARY=$(if [[ "$AUTO_REBOOT_UPDATES" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Enabled (04:00 local)"; else echo "Skipped"; fi)
     NEW_MOTD_SUMMARY=$(if [[ "$ENABLE_MOTD_BANNER" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Enabled"; else echo "Skipped"; fi)
     NEW_FAIL2BAN_SUMMARY=$(if [[ "$INSTALL_FAIL2BAN" =~ ^([yY][eE][sS]|[yY])$ ]]; then echo "To be Installed"; else echo "Skipped"; fi)
@@ -1827,14 +1665,17 @@ show_summary_and_confirm() {
 display_prior_run_state() {
     [[ ! -f "$TUBSS_STATE_FILE" ]] && return 0
 
+    # `|| true` on each: a state file from an older/different TUBSS version
+    # missing one of these keys would otherwise make grep exit non-zero and,
+    # under pipefail, abort the whole run right here at startup.
     local ver start end status last_step failed_step host
-    ver=$(grep "^TUBSS_VERSION=" "$TUBSS_STATE_FILE" | cut -d= -f2)
-    start=$(grep "^RUN_START=" "$TUBSS_STATE_FILE" | cut -d= -f2)
-    end=$(grep "^RUN_END=" "$TUBSS_STATE_FILE" | cut -d= -f2)
-    status=$(grep "^STATUS=" "$TUBSS_STATE_FILE" | cut -d= -f2)
-    last_step=$(grep "^LAST_STEP=" "$TUBSS_STATE_FILE" | cut -d= -f2)
-    failed_step=$(grep "^FAILED_STEP=" "$TUBSS_STATE_FILE" | cut -d= -f2)
-    host=$(grep "^HOSTNAME=" "$TUBSS_STATE_FILE" | cut -d= -f2)
+    ver=$(grep "^TUBSS_VERSION=" "$TUBSS_STATE_FILE" | cut -d= -f2) || true
+    start=$(grep "^RUN_START=" "$TUBSS_STATE_FILE" | cut -d= -f2) || true
+    end=$(grep "^RUN_END=" "$TUBSS_STATE_FILE" | cut -d= -f2) || true
+    status=$(grep "^STATUS=" "$TUBSS_STATE_FILE" | cut -d= -f2) || true
+    last_step=$(grep "^LAST_STEP=" "$TUBSS_STATE_FILE" | cut -d= -f2) || true
+    failed_step=$(grep "^FAILED_STEP=" "$TUBSS_STATE_FILE" | cut -d= -f2) || true
+    host=$(grep "^HOSTNAME=" "$TUBSS_STATE_FILE" | cut -d= -f2) || true
 
     echo ""
     echo -e "============================================================"
@@ -1845,8 +1686,7 @@ display_prior_run_state() {
         echo -e "  Status:      ${GREEN}completed${NC}"
         echo -e "  Finished:    ${end:-unknown}"
     elif [[ "$status" == "pending_reboot" ]]; then
-        # CC-104 Fix C: loud warning — the running kernel is NOT yet on the
-        # declared config. User needs to reboot before trusting this host.
+        # Loud warning — the live config is not yet the declared config.
         echo -e "  Status:      ${YELLOW}pending_reboot${NC}"
         echo -e "  Finished:    ${end:-unknown}"
         echo -e "  ${YELLOW}>>> Previous run completed but a reboot is still required.${NC}"
@@ -1906,11 +1746,9 @@ mark_run_state_failed() {
 }
 
 finalize_run_state() {
-    # CC-104 Fix C: accept an optional status override. Callers pass
-    # "pending_reboot" when the user declines a reboot while
-    # NETPLAN_APPLY_PENDING=1, so the state file reflects reality and the
-    # next run's "config already exists — skipping" shortcut does not make
-    # the bad state permanent.
+    # Optional status override: callers pass "pending_reboot" when the user
+    # declines a reboot while NETPLAN_APPLY_PENDING=1, so the next run's
+    # "config already exists — skipping" shortcut can't make that permanent.
     local state=${1:-completed}
     [[ ! -f "$TUBSS_STATE_FILE" ]] && return 0
     sed -i "s|^STATUS=.*|STATUS=${state}|" "$TUBSS_STATE_FILE"
@@ -1919,9 +1757,8 @@ finalize_run_state() {
 
 # --- Step 4: Apply Configuration ---
 apply_configuration() {
-    # CC-104 Fix D: Unattended + static IP = remote-lockout risk on auto-reboot.
-    # Require explicit TUBSS_FORCE_REBOOT=1 opt-in to proceed. Dry-run is fine
-    # (no real mutations), so only gate the live path.
+    # Unattended + static IP risks remote lockout on auto-reboot, so require an
+    # explicit TUBSS_FORCE_REBOOT=1 opt-in. Dry-run mutates nothing, so it's exempt.
     if (( TUBSS_UNATTENDED == 1 )) \
         && [[ "${NET_TYPE:-}" == "static" ]] \
         && [[ "${TUBSS_FORCE_REBOOT:-0}" != "1" ]] \
@@ -1947,10 +1784,9 @@ apply_configuration() {
     install_packages
     update_run_state_step "install_packages"
 
-    # Unconditional, not just an AD-join prerequisite: accurate system time
-    # matters for any hardened server (TLS certificate validation, log/audit
-    # timestamp accuracy, cron reliability). Runs early so chrony has the
-    # wall-clock time of every later step to converge in the background.
+    # Unconditional, not just an AD-join prerequisite: accurate time matters for
+    # TLS validation, log timestamps, and cron. Early, so chrony can converge
+    # in the background during the remaining steps.
     CURRENT_STEP="configure_time_sync"
     ensure_time_sync
     update_run_state_step "configure_time_sync"
@@ -1963,8 +1799,7 @@ apply_configuration() {
     configure_fail2ban
     update_run_state_step "configure_fail2ban"
 
-    # CC-104: SSH hardening runs AFTER fail2ban so fail2ban protects SSH
-    # even if hardening fails. Feature is opt-in (default OFF).
+    # Runs after fail2ban so fail2ban still protects SSH if hardening fails.
     CURRENT_STEP="ssh_hardening"
     configure_ssh_hardening
     update_run_state_step "ssh_hardening"
@@ -2023,7 +1858,14 @@ configure_apparmor_debian() {
     else
         echo -e "  ${YELLOW}[WARN]${NC} update-grub not found — run it manually before rebooting."
     fi
-    echo -e "${GREEN}[OK]${NC} AppArmor kernel parameters added — takes effect on next boot."
+    # sed exits 0 whether or not the pattern matched, so verify the edit
+    # actually landed before claiming success (a non-stock grub file may not
+    # have this exact GRUB_CMDLINE_LINUX_DEFAULT="..." form).
+    if grep -q 'apparmor=1' "$grub_file" 2>/dev/null; then
+        echo -e "${GREEN}[OK]${NC} AppArmor kernel parameters added — takes effect on next boot."
+    else
+        echo -e "  ${YELLOW}[WARN]${NC} Could not find a matching GRUB_CMDLINE_LINUX_DEFAULT line in ${grub_file} — apparmor=1 was NOT added. Edit it by hand."
+    fi
 }
 
 configure_snapshot() {
@@ -2042,16 +1884,19 @@ configure_snapshot() {
             echo -e "${GREEN}[OK]${NC} ZFS snapshot created successfully."
         elif command -v btrfs &> /dev/null && df -t btrfs / 2>/dev/null | grep -q ' /$'; then
             snapshot_name="tubss-pre-config-$(date +%Y%m%d-%H%M)"
-            btrfs subvolume create /@snapshots &>/dev/null
+            if [[ ! -d /@snapshots ]]; then
+                local _btrfs_create_err
+                if ! _btrfs_create_err=$(btrfs subvolume create /@snapshots 2>&1); then
+                    echo -e "  ${YELLOW}[WARN]${NC} Could not create /@snapshots: ${_btrfs_create_err}"
+                fi
+            fi
             run_step "Creating Btrfs snapshot" btrfs subvolume snapshot -r "/@" "/@snapshots/$snapshot_name" || { echo -e "\n${RED}[ERROR]${NC} Creating Btrfs snapshot failed (exit $?)"; exit 1; }
             SNAPSHOT_STATUS="Created: $snapshot_name (Btrfs)"
             echo -e "${GREEN}[OK]${NC} Btrfs snapshot created successfully."
         else
-            # CREATE_SNAPSHOT=yes but none of timeshift/zfs/btrfs was
-            # detected -- without this branch SNAPSHOT_STATUS never gets
-            # set here and stays "pending", which snapshot_summary_value()
-            # would then render as the operator's original "yes" intent
-            # post-execution, falsely implying a snapshot was created.
+            # Must set a status here: left "pending", snapshot_summary_value()
+            # would render the operator's "yes" intent post-execution and
+            # falsely imply a snapshot was created.
             SNAPSHOT_STATUS="Skipped (no snapshot tool detected)"
             echo -e "  ${YELLOW}[WARN]${NC} No supported snapshot utility (Timeshift, ZFS, or Btrfs) found — skipping snapshot."
         fi
@@ -2079,35 +1924,16 @@ install_packages() {
         echo -e "${YELLOW}[TUBSS] Updating package lists...${NC}"
         echo "[DRY-RUN] apt-get update -y"
     else
-        # No announce here -- run_step()'s own spinner prints "[TUBSS]
-        # Updating package lists ..." immediately via its own bypass of
-        # setup_logging()'s tee pipe. A duplicate announce here used to sit
-        # buffered in that pipe (no trailing newline) until some LATER
-        # line's newline flushed it, causing the same text to render
-        # twice, out of order, merged into whatever printed after it.
+        # No announce here -- run_step()'s spinner prints its own header and
+        # bypasses setup_logging()'s tee pipe. A second announce would sit
+        # buffered in that pipe and re-render later, out of order.
         run_step "Updating package lists" apt-get update -y || { echo -e "\n${RED}[ERROR]${NC} Updating package lists failed (exit $?)"; exit 1; }
     fi
     echo -e "${GREEN}[OK]${NC} Package lists updated."
 
-    # CC-131 / CC-133: apply pending package upgrades BEFORE installing new packages.
-    # Always-on — matches the always-on `apt-get update` behavior. Uses
-    # `apt-get upgrade` (not dist-upgrade) to avoid silent metapackage
-    # removals or kernel-metapackage shuffles on mixed-release boxes.
-    #
-    # Guards:
-    #   NEEDRESTART_MODE=a           — silences needrestart (24.04 hang fix)
-    #   DEBIAN_FRONTEND=noninteractive — suppresses maintainer-script prompts
-    #   -o Dpkg::Options --force-confdef --force-confold — explicitly keep
-    #     existing conffiles on upgrade. Without this, the behavior depends
-    #     on apt defaults (usually "keep old" but implicit). Making it
-    #     explicit means a TUBSS re-run never silently overwrites a conffile
-    #     the operator hand-edited (e.g. /etc/ssh/sshd_config).
-    #
-    # CC-133: failure is WARN-AND-CONTINUE (not fatal). Rationale: a
-    # hardened box running outdated packages is still more secure than an
-    # un-hardened box, so we prefer to finish UFW/fail2ban/SSH hardening
-    # even if the upgrade step itself stumbles. Set PACKAGE_UPDATES_STATUS
-    # so the final summary reflects reality.
+    # `apt-get upgrade`, not dist-upgrade, to avoid silent metapackage removals.
+    # Guards: needrestart's 24.04 hang, maintainer prompts, and clobbering
+    # hand-edited conffiles. Warn-and-continue so the rest of the run still lands.
     PACKAGE_UPDATES_STATUS="Applied"
     if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
         echo -e "${YELLOW}[TUBSS] Applying pending package updates...${NC}"
@@ -2122,27 +1948,10 @@ install_packages() {
             -o Dpkg::Options::="--force-confdef" \
             -o Dpkg::Options::="--force-confold" \
             upgrade; then
-            # `apt-get upgrade` exiting 0 only means the command itself
-            # didn't error — it does NOT guarantee every available update
-            # was actually applied. Verify by checking what's still
-            # upgradable instead of trusting the exit code alone — this is
-            # exactly the gap that let a real run report "Applied" while
-            # updates remained pending.
-            #
-            # The single most common reason packages remain upgradable
-            # here is entirely normal, not a problem: `apt-get upgrade`
-            # (unlike `full-upgrade`/`dist-upgrade`) deliberately excludes
-            # any update that would need to install or remove OTHER
-            # packages to satisfy dependencies — the classic case being a
-            # new kernel meta-package. apt reports these as "kept back",
-            # and they stay listed as upgradable indefinitely until a
-            # full-upgrade or the next unattended-upgrades cycle picks
-            # them up. Phased rollout and held/pinned packages are rarer
-            # causes of the same symptom. Status stays "Applied" (this
-            # step DID what apt-get upgrade is designed to do) with a
-            # short informational suffix — NOT "Partial", so this doesn't
-            # trip the end-of-run acknowledgment gate on what is normal
-            # behavior on most real Ubuntu boxes with a pending kernel.
+            # A 0 exit doesn't mean every update landed. Held-back packages are
+            # normal (`apt-get upgrade` skips anything needing add/remove, e.g. a
+            # new kernel), so the status stays "Applied" with a suffix rather than
+            # "Partial", which would trip the end-of-run acknowledgment gate.
             local _still_upgradable
             _still_upgradable=$(apt list --upgradable 2>/dev/null | grep -c '^[a-z0-9]' || true)
             if (( _still_upgradable > 0 )); then
@@ -2159,41 +1968,18 @@ install_packages() {
         fi
     fi
 
-    # Distro-aware base package set (P5).
-    # - Debian ships apparmor-utils separately; Ubuntu pulls it via apparmor.
-    #
-    # CC-180: this whole set is now candidate-checked the same way the AD
-    # package loop already was, instead of being handed to `apt-get install`
-    # as a flat literal. A single missing package used to abort the entire
-    # run with a generic error that didn't even name the culprit. This also
-    # closes a real, confirmed-live bug: the fetch tool was previously a
-    # static "Ubuntu = neofetch" / "Debian 12 = neofetch, else fastfetch"
-    # table — neofetch has NO installation candidate on Ubuntu 26.04 (only
-    # fastfetch does), so that table would have silently broken the whole
-    # run on the newest Ubuntu LTS the moment it shipped. Resolving it here,
-    # dynamically, after `apt-get update` has already run above (so the
-    # candidate data is fresh — this couldn't be decided reliably any
-    # earlier in the script), makes it self-correcting for whatever the
-    # current release actually has, instead of a table someone has to
-    # remember to update for every new OS release.
-    # chrony is unconditional, not AD-gated — accurate system time matters
-    # for any hardened server (TLS certificate validation, log/audit
-    # timestamp accuracy, cron reliability), not just for the Kerberos
-    # handshake an AD join happens to need it for.
+    # Distro-aware base package set; Debian ships apparmor-utils separately.
+    # Every entry is candidate-checked so one package missing on a release can't
+    # abort the run, and the fetch tool is resolved dynamically rather than from
+    # a per-release table (neofetch has no candidate on Ubuntu 26.04).
     local _base_pkgs=("curl" "ufw" "unattended-upgrades" "apparmor" "net-tools" "htop" "vim" "build-essential" "rsync" "chrony")
     if [[ "$DETECTED_OS" == "debian" ]]; then
         _base_pkgs+=("apparmor-utils")
     fi
-    # Under --dry-run, the real `apt-get update` above was never actually
-    # run (dry-run performs zero filesystem writes, even benign ones like
-    # refreshing apt's own lists), so on a box whose apt cache happens to be
-    # empty or stale, pkg_available can false-negative here — a real,
-    # accepted trade-off (same one the AD package loop already makes). Don't
-    # name that as THE cause in the warning below, though — it's one
-    # possible explanation, not a diagnosis. (A locale mismatch can produce
-    # the identical symptom outside of dry-run too; pkg_available forces
-    # LC_ALL=C precisely so that isn't a live cause anymore, but the warning
-    # shouldn't assert a specific root cause it can't actually confirm.)
+    # Under --dry-run no `apt-get update` actually ran, so pkg_available can
+    # false-negative against a stale cache. The caveat below stays worded as
+    # one possible explanation, not a diagnosis — a locale mismatch produces
+    # the identical symptom.
     local _cand_caveat=""
     (( ${TUBSS_DRY_RUN:-0} == 1 )) && _cand_caveat=" (under --dry-run this checks apt's existing cache rather than a freshly updated one — verify independently with: apt-cache policy <package>)"
     if pkg_available "neofetch"; then
@@ -2219,19 +2005,11 @@ install_packages() {
     if [[ "$INSTALL_WEBMIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("webmin"); fi
     if [[ "$INSTALL_NFS" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("nfs-common"); fi
     if [[ "$INSTALL_SMB" =~ ^([yY][eE][sS]|[yY])$ ]]; then PACKAGES+=("cifs-utils"); fi
-    # CC-175: AD domain-join stack — only pulled in when the operator asked
-    # for a join, so a plain hardening run stays free of realmd/sssd. `realm
-    # join` (no --install) installs nothing itself, so every package the join
-    # needs — including sssd — has to be listed here explicitly. chrony is
-    # NOT in this list — it's unconditional now (see _base_pkgs above), since
-    # accurate time matters beyond just the Kerberos handshake this list was
-    # originally built for.
-    #
-    # Each package is candidate-checked first: Debian 14 (testing) currently
-    # ships realmd/adcli but not sssd, and handing apt-get an uninstallable
-    # package would abort the entire hardening run. Missing pieces are
-    # warned about here; join_ad_domain() then reports a failed join instead
-    # of taking the whole script down with it.
+    # AD domain-join stack, only pulled in when a join was requested. `realm
+    # join` (without --install) installs nothing itself, so every dependency
+    # must be listed explicitly. Candidate-checked because e.g. Debian 14
+    # ships realmd/adcli but not sssd, and an uninstallable package would
+    # abort the whole run; join_ad_domain() reports a failed join instead.
     if [[ "$JOIN_DOMAIN" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         local ad_pkg
         for ad_pkg in realmd sssd sssd-tools libnss-sss libpam-sss adcli; do
@@ -2269,8 +2047,8 @@ install_packages() {
         fi
     done
 
-    # P1: Flip the autoremove guard BEFORE we mutate the package database so
-    # that an interrupted install still triggers cleanup on exit.
+    # Flip the autoremove guard BEFORE mutating the package database so an
+    # interrupted install still triggers cleanup on exit.
     if [[ ${#packages_to_install[@]} -gt 0 ]]; then
         PACKAGES_INSTALLED=1
         if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
@@ -2286,18 +2064,11 @@ install_packages() {
         echo -e "  ${GREEN}[SKIP]${NC} All packages already installed"
     fi
 
-    # Start chrony converging NOW rather than waiting for whatever step
-    # first needs an accurate clock (originally just the AD join; chrony is
-    # unconditional now, so this is too). `systemctl enable --now` returns
-    # as soon as chronyd is launched — it does not block on NTP convergence,
-    # which chronyd does in its own background process. Starting it here
-    # gives chronyd the wall-clock time of every later step (UFW, fail2ban,
-    # SSH hardening, auto-updates, telemetry, and the AD join if any) to
-    # converge in the background, so ensure_time_sync()'s own poll-wait
-    # wherever it's called is usually a near-instant confirmation instead
-    # of a fresh up-to-30s wait. Purely an optimization: ensure_time_sync()
-    # still does its own enable --now as a fallback (idempotent, harmless)
-    # if this is skipped or chrony wasn't actually installed.
+    # Start chrony converging now. `systemctl enable --now` returns as soon as
+    # chronyd launches and doesn't block on NTP convergence, so starting here
+    # lets it converge during the remaining steps and makes ensure_time_sync()'s
+    # poll-wait a near-instant confirmation. Purely an optimization —
+    # ensure_time_sync() still does its own idempotent enable --now.
     if [[ ${TUBSS_DRY_RUN:-0} -ne 1 ]]; then
         local _early_chrony_svc="" _early_candidate
         for _early_candidate in chrony chronyd; do
@@ -2398,10 +2169,9 @@ _network_renderer() {
     fi
 }
 
-# P0: Apply the freshly-generated netplan config. Prefer `netplan try` because
-# it auto-reverts after ~120s if SSH dies, preventing remote lockout. Fall
-# back to `netplan apply` when `try` is unavailable or fails in unattended
-# mode; on failure, set NETPLAN_APPLY_PENDING so the reboot prompt is forced.
+# Apply the freshly-generated netplan config. Prefer `netplan try` — it
+# auto-reverts if SSH dies, preventing remote lockout. Falls back to `netplan
+# apply`; on failure sets NETPLAN_APPLY_PENDING so the reboot prompt is forced.
 _netplan_apply_or_try() {
     local gen_err
     gen_err=$(mktemp)
@@ -2422,12 +2192,9 @@ _netplan_apply_or_try() {
         return 0
     fi
 
-    # CC-104 Fix A: `netplan try` requires an interactive TTY to confirm the
-    # config. With stdin redirected or no controlling terminal, some netplan
-    # builds silently revert BUT exit 0 — which falsely reports "applied live"
-    # and leaves the host running the old config. Skip `try` entirely in that
-    # case and defer apply to reboot (safer for remote sessions). The config
-    # file is already written; reboot will activate it.
+    # `netplan try` needs an interactive TTY to confirm. Without one, some
+    # netplan builds silently revert yet still exit 0, falsely reporting
+    # "applied live". Skip `try` and defer the apply to reboot instead.
     if [[ ! -t 0 ]]; then
         echo -e "  ${YELLOW}[NETPLAN]${NC} No TTY available — skipping 'netplan try' (requires interactive confirm)."
         echo -e "  ${YELLOW}[NETPLAN]${NC} Will defer apply to reboot (safer for remote sessions)."
@@ -2506,12 +2273,10 @@ configure_network() {
             echo -e "${YELLOW}[SKIPPED]${NC} Already using DHCP."
         fi
     else
-        # CC-104 Fix C/M1: if the previous run left the box in pending_reboot
-        # state, DO NOT short-circuit on "config already exists" — the config
-        # was never actually applied to the running kernel AND the user may
-        # have just supplied corrected IP/gateway values in this session.
-        # Remove the stale file and fall through to the normal write path so
-        # the fresh prompt answers are honoured.
+        # After a pending_reboot run, don't short-circuit on "config already
+        # exists": it was never applied to the running kernel, and this session
+        # may carry corrected IP/gateway values. Remove the stale file and fall
+        # through to the normal write path.
         local prior_status=""
         if [[ -r "$TUBSS_STATE_FILE" ]]; then
             prior_status=$(grep '^STATUS=' "$TUBSS_STATE_FILE" 2>/dev/null | cut -d= -f2)
@@ -2533,16 +2298,13 @@ configure_network() {
         fi
 
         warn_if_gateway_unreachable
-        # P0: Validate gateway is inside the chosen subnet BEFORE writing
-        # anything. Refuse with a clear error otherwise.
+        # Validate the gateway is inside the chosen subnet before writing anything.
         if ! validate_gateway_in_subnet "$STATIC_IP" "$NETMASK_CIDR" "$GATEWAY"; then
             exit 1
         fi
-        # P0: Disable cloud-init network management FIRST so it cannot
-        # race with our write or overwrite on next boot.
-        # CC-104 Fix E: honour dry-run on the interactive static-IP path —
-        # cloud-init override, backup dir mkdir, and netplan mv are real
-        # mutations that were leaking through dry-run.
+        # Disable cloud-init network management first so it can't race this
+        # write or overwrite it on next boot. Dry-run guarded — the override
+        # write, backup mkdir, and netplan mv are all real mutations.
         if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
             echo "[DRY-RUN] disable_cloud_init_network (write /etc/cloud/cloud.cfg.d/99-tubss-disable-network.cfg)"
         else
@@ -2589,9 +2351,7 @@ EOF
             # Keep the static config root-only to match the rest of /etc/netplan.
             chmod 600 "$network_config_file" 2>/dev/null || true
         fi
-        # P0: attempt to apply immediately via `netplan try` (auto-reverts
-        # on SSH loss). Falls back to `netplan apply` or sets the
-        # deferred-reboot flag.
+        # Apply immediately via `netplan try` (auto-reverts on SSH loss).
         _netplan_apply_or_try
         if (( NETPLAN_APPLY_PENDING == 1 )); then
             echo -e "${YELLOW}[OK]${NC} Static IP config written for '$INTERFACE_NAME' — reboot required to activate."
@@ -2676,16 +2436,11 @@ configure_ufw() {
             echo "[DRY-RUN] ufw allow ssh"
             echo "[DRY-RUN] ufw --force enable"
         else
-            # Some kernels (minimal cloud/container images, certain
-            # hardened or nftables-only builds) have the ip6tables binary
-            # present but its "filter" table unreachable. Every ufw
-            # command that touches the v6 ruleset then exits non-zero, and
-            # since these are plain unguarded calls, that used to abort
-            # the ENTIRE TUBSS run right here under `set -e` — before UFW
-            # itself finished, let alone fail2ban/SSH hardening/AD/
-            # anything else. Probe for it and tell ufw to manage IPv4
-            # only rather than let an IPv6-only firewall backend problem
-            # take down the whole run.
+            # Some kernels (minimal cloud/container images, nftables-only
+            # builds) ship the ip6tables binary with an unreachable filter
+            # table, so every ufw call touching the v6 ruleset exits non-zero
+            # and kills the run under `set -e`. Probe first and restrict ufw
+            # to IPv4 instead.
             if [[ -f /etc/default/ufw ]] && ! ip6tables -L >/dev/null 2>&1; then
                 sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw
                 echo -e "  ${YELLOW}[WARN]${NC} ip6tables unusable on this kernel — UFW will manage IPv4 only."
@@ -2802,7 +2557,7 @@ EOF
     fi
 }
 
-# --- CC-104: Opt-in SSH hardening ---
+# --- Opt-in SSH hardening ---
 # Applies a drop-in /etc/ssh/sshd_config.d/00-tubss-hardening.conf when
 # the distro supports sshd_config.d, otherwise edits /etc/ssh/sshd_config
 # in place via sed. Always backs up /etc/ssh/sshd_config before editing,
@@ -2825,12 +2580,9 @@ configure_ssh_hardening() {
 
     local sshd_config="/etc/ssh/sshd_config"
     local sshd_d_dir="/etc/ssh/sshd_config.d"
-    # CC-178: named 00- (not 99-) so it sorts and is applied BEFORE
-    # cloud-init's own /etc/ssh/sshd_config.d/50-cloud-init.conf, which ships
-    # `PasswordAuthentication yes` on every cloud-init-provisioned image.
-    # sshd honors the first value it sees per keyword — at 99- this file's
-    # `PasswordAuthentication no` silently lost to cloud-init's 50- on every
-    # such host, which is most VM/cloud homelab targets.
+    # Named 00-, not 99-, so it sorts before cloud-init's 50-cloud-init.conf,
+    # which ships `PasswordAuthentication yes`. sshd honors the first value it
+    # sees per keyword, so a later file would lose to cloud-init.
     local dropin="${sshd_d_dir}/00-tubss-hardening.conf"
     local backup_ts
     backup_ts=$(date +%Y%m%d%H%M)
@@ -2862,10 +2614,9 @@ configure_ssh_hardening() {
         fi
     fi
 
-    # CC-104 Fix M2: prefer the drop-in ONLY if sshd_config actually Includes
-    # /etc/ssh/sshd_config.d/*.conf. On hosts where the Include directive was
-    # removed, the drop-in would be silently ignored — fall back to editing
-    # sshd_config directly so hardening actually takes effect.
+    # Only prefer the drop-in if sshd_config actually Includes sshd_config.d/*;
+    # without that directive the drop-in is silently ignored, so fall back to
+    # editing sshd_config directly.
     local use_dropin=0
     if [[ -d "$sshd_d_dir" ]]; then
         if grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' "$sshd_config" 2>/dev/null; then
@@ -2875,20 +2626,12 @@ configure_ssh_hardening() {
         fi
     fi
 
-    # CC-175 follow-up: a domain account has no SSH key and no local password
-    # — its ONLY credential is the AD password. Disabling password auth on a
-    # domain-joined box therefore locks out exactly the people the join was
-    # performed for. Re-allow password auth for precisely the accounts
-    # `realm permit` let in (no wider) via a trailing sshd Match block.
-    #
-    # `sshd -t` does not require the matched group/user to exist, so this is
-    # safe to write before (or without) a successful join — a Match clause on
-    # a group sssd has not created yet simply never matches.
-    #
-    # DROP-IN PATH ONLY. The sed fallback appends individual keys across
-    # runs; a later run's append would land after this Match line and have
-    # its scope silently narrowed to domain users. That is a deliberate
-    # boundary — the fallback path gets a manual-fix warning instead.
+    # A domain account has no SSH key and no local password, so disabling
+    # password auth on a joined box locks out exactly the people the join was
+    # for. Re-allow it via a trailing Match block scoped to no more than what
+    # `realm permit` let in. Safe to write pre-join: `sshd -t` doesn't require
+    # the group to exist. Drop-in path only — in the sed fallback a later run's
+    # append would land inside the Match block and be silently rescoped.
     local ad_match_line=""
     if [[ "$disable_pw_auth" == "yes" ]] && [[ "${JOIN_DOMAIN:-no}" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         case "${AD_PERMIT_MODE:-a}" in
@@ -2957,14 +2700,12 @@ configure_ssh_hardening() {
 
     # --- Apply: prefer drop-in (only if sshd_config Includes it), fall back to sed-in-place ---
     if (( use_dropin == 1 )); then
-        # Idempotency: if drop-in already contains the exact desired settings, skip write.
-        # NB: built by concatenation, NOT `want=$(printf ...)`. Command
-        # substitution strips trailing newlines, which glued the first
-        # setting onto the end of the comment line — silently commenting out
-        # `PasswordAuthentication no`, the one setting the domain-login
-        # exception below exists to compensate for.
+        # Idempotency: skip the write if the drop-in already matches.
+        # Built by concatenation, NOT `want=$(printf ...)`: command substitution
+        # strips the trailing newline and glues the first setting onto the
+        # comment line, commenting out `PasswordAuthentication no`.
         local want
-        want='# TUBSS SSH hardening (CC-104)'$'\n''# Managed file — regenerate via tubss_setup.sh'$'\n'
+        want='# TUBSS SSH hardening'$'\n''# Managed file — regenerate via tubss_setup.sh'$'\n'
         local s
         for s in "${settings[@]}"; do
             want+="${s}"$'\n'
@@ -2977,14 +2718,10 @@ configure_ssh_hardening() {
             want+="${ad_match_line}"$'\n'
             want+='    PasswordAuthentication yes'$'\n'
         fi
-        # Comparison only (does NOT affect the write below): $(cat "$dropin")
-        # always strips trailing newlines, but $want always ends in one (by
-        # construction, per the comment above) — comparing them raw never
-        # matches, so the drop-in was silently rewritten on every single
-        # run even when content was already correct. Wrapping $want in its
-        # own command substitution strips it the same way, for a symmetric
-        # comparison, while `printf '%s' "$want"` below still writes the
-        # original, structurally-intact string.
+        # Comparison only: $(cat) strips the trailing newline that $want always
+        # has, so a raw compare never matches and rewrites the file every run.
+        # Wrapping $want in its own substitution makes the compare symmetric;
+        # the printf below still writes the intact string.
         if [[ -f "$dropin" ]] && [[ "$(cat "$dropin")" == "$(printf '%s' "$want")" ]]; then
             echo -e "  ${GREEN}[SKIP]${NC} ${dropin} already matches desired state."
         else
@@ -3009,47 +2746,34 @@ configure_ssh_hardening() {
             if grep -Eq "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]" "$sshd_config"; then
                 sed -i -E "s|^[[:space:]]*#?[[:space:]]*${key}[[:space:]]+.*$|${key} ${value}|" "$sshd_config"
             else
-                printf '\n# TUBSS SSH hardening (CC-104)\n%s\n' "$s" >> "$sshd_config"
+                printf '\n# TUBSS SSH hardening\n%s\n' "$s" >> "$sshd_config"
             fi
             echo -e "  ${GREEN}[OK]${NC} Set ${key} ${value}"
         done
     fi
 
     # --- Validate ---
-    # CC-181: this used to `return 1` here, and the call site invoked this
-    # function bare (not guarded) — under `set -e` a non-zero return from a
-    # plain, unconditional function call fires the ERR trap, so a validation
-    # failure aborted the ENTIRE run mid-pipeline (before auto-updates/MOTD/
-    # telemetry/AD/network), even though the backup was already safely
-    # restored and sshd itself was never left broken. Every other warn-and-
-    # continue function in this file (package upgrade, the whole AD path)
-    # always returns 0 and communicates its real outcome via a status
-    # variable instead — matching that same convention here, rather than
-    # papering over it with `|| true` at the call site, so this function's
-    # contract is consistent with the rest of the codebase.
+    # Returns 0 even on validation failure, reporting the outcome via
+    # SSH_HARDENING_STATUS — matching every other warn-and-continue function
+    # here. A non-zero return from this unguarded call would fire the ERR trap
+    # under `set -e` and abort the whole run, even though the backup is
+    # restored and sshd was never left broken.
     local _sshd_t_output
     if ! _sshd_t_output=$(sshd -t -f "$sshd_config" 2>&1); then
         echo -e "  ${RED}[ERROR]${NC} sshd -t validation failed — restoring backup."
-        # Previously swallowed via 2>/dev/null — a real validation failure
-        # on a real box had no way to say WHY beyond "validation failed",
-        # making it undiagnosable from the log alone. Show sshd's actual
-        # complaint.
+        # Show sshd's actual complaint — "validation failed" alone is
+        # undiagnosable from the log.
         if [[ -n "$_sshd_t_output" ]]; then
             echo -e "  ${RED}[ERROR]${NC} sshd -t said:"
-            # printf, not echo -e: sshd's own output could contain
-            # backslash sequences that echo -e would misinterpret as
-            # escapes instead of printing literally.
+            # printf, not echo -e: sshd's output may contain backslash
+            # sequences that echo -e would interpret as escapes.
             local _line
             while IFS= read -r _line; do printf '    %s%s%s\n' "$RED" "$_line" "$NC"; done <<< "$_sshd_t_output"
         fi
         cp -a "$backup" "$sshd_config"
-        # Only remove the drop-in if THIS run wrote it. If it already
-        # matched the desired state (dropin_written=0, the [SKIP] branch
-        # above), the validation failure has nothing to do with TUBSS's
-        # content — it means something else in sshd_config (an unrelated
-        # hand edit, another tool's drop-in) is broken. Deleting a known-
-        # good, previously-applied drop-in in that case doesn't fix the
-        # real problem; it just silently un-hardens SSH on the next reload.
+        # Only remove the drop-in if THIS run wrote it. If it already matched,
+        # the breakage is elsewhere in sshd_config, and deleting a known-good
+        # drop-in would just silently un-harden SSH on the next reload.
         if (( dropin_written == 1 )) && [[ -f "$dropin" ]]; then
             rm -f "$dropin"
         fi
@@ -3099,20 +2823,12 @@ configure_auto_updates() {
         echo -e "${YELLOW}[SKIPPED]${NC} Automatic security updates."
     fi
 
-    # Auto-reboot is a separate, more disruptive opt-in from auto-updates
-    # itself (a server that must stay up until a human approves a reboot
-    # should never get one it didn't ask for) — tracked via its own drop-in
-    # file rather than editing the distro-shipped 50unattended-upgrades in
-    # place, which ships these directives commented out in different
-    # positions across releases and is fragile to patch idempotently. apt.
-    # conf.d applies files in lexical order, so 51- correctly layers on top
-    # of the base 50- config without touching it.
-    #
-    # Idempotent both ways: removes the drop-in when auto-reboot is not (or
-    # no longer) requested, not just skips writing it — same lesson as the
-    # AD sudoers idempotency fix (CC-175 follow-up): a re-run where the
-    # operator changes their mind must actually revoke the prior setting,
-    # not leave it stale.
+    # Auto-reboot is a separate, more disruptive opt-in than auto-updates, and
+    # gets its own drop-in rather than patching the distro's
+    # 50unattended-upgrades, which places these directives differently across
+    # releases. apt.conf.d applies lexically, so 51- layers on top of 50-.
+    # Idempotent both ways: the drop-in is removed when auto-reboot is no
+    # longer requested, so a re-run actually revokes the prior setting.
     local _reboot_dropin="/etc/apt/apt.conf.d/51-tubss-auto-reboot"
     if [[ "$AUTO_REBOOT_UPDATES" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
@@ -3131,32 +2847,17 @@ configure_auto_updates() {
     fi
 }
 
-# Standard, generic authorized-access-only login banner — opt-in, aimed at
-# hardened/compliance-flavored deployments rather than personal homelab
-# boxes. Text mirrors the DISA STIG/CIS-benchmark short-form consent
-# banner: "may be monitored" (not "is monitored") is deliberate — TUBSS
-# does not configure any logging/monitoring infrastructure itself, so the
-# banner must not assert one is active. This is standard boilerplate, not
-# legal advice; if this needs to hold up for real compliance/prosecution
-# purposes in your jurisdiction, have it reviewed by actual counsel.
-#
-# Appends a clearly delimited block rather than overwriting /etc/motd
-# outright, and removal strips only that block — a fresh install usually
-# has an empty /etc/motd, but that's not guaranteed, and clobbering
-# whatever else might be there (distro branding, a prior custom message)
-# would be exactly the kind of silent-data-loss bug this whole effort has
-# been about avoiding. Idempotent both ways: a re-run that turns this off
-# must actually remove the block, not leave it stale.
+# Opt-in authorized-access-only login banner, mirroring the DISA STIG/CIS
+# short-form consent text. "may be monitored" (not "is monitored") is
+# deliberate: TUBSS configures no monitoring, so the banner must not claim any.
+# Boilerplate, not legal advice — have counsel review it if it must hold up.
+# Appends a delimited block rather than overwriting /etc/motd, and removal
+# strips only that block, so distro branding or a prior message survives.
+# Idempotent both ways: turning this off actually removes the block.
 configure_motd_banner() {
-    # /etc/motd has no comment syntax — anything written into it prints as
-    # literal visible text at every login. A prior version wrapped the
-    # notice in "# BEGIN/END TUBSS-managed..." marker lines to find and
-    # remove its own block later; confirmed on a real run that those
-    # markers themselves show up in the banner every user sees, which
-    # defeats the point of a clean authorized-access notice. The banner
-    # text is fixed (not user-configurable), so its own content — the
-    # border line and one distinctive sentence — is unique enough to
-    # detect and remove without adding anything extra for users to see.
+    # /etc/motd has no comment syntax: BEGIN/END marker lines would print to
+    # every user at login. The banner text is fixed, so its border line plus
+    # one distinctive sentence are enough to detect and remove the block.
     local _motd_border='***************************************************************************'
     local _motd_unique_line='This system is for authorized use only. All activity on this system may be'
     if [[ "$ENABLE_MOTD_BANNER" =~ ^([yY][eE][sS]|[yY])$ ]]; then
@@ -3167,17 +2868,13 @@ configure_motd_banner() {
             echo ""
             echo "[DRY-RUN] append authorized-access notice block to /etc/motd"
         else
-            # If existing content doesn't end in a newline, our border line
-            # would land glued onto the previous line's end instead of at
-            # start-of-line, which would break the removal logic below (it
-            # matches whole lines only).
+            # Without a trailing newline the border would be glued onto the
+            # previous line, breaking the whole-line removal logic below.
             if [[ -s /etc/motd ]] && [[ -n "$(tail -c1 /etc/motd)" ]]; then
                 echo "" >> /etc/motd
             fi
-            # Quoted 'EOF' (no variable/command expansion) with the one
-            # dynamic line printed separately — the fixed text has no
-            # $/backtick/backslash today, but an unquoted heredoc is an
-            # injection surface for whoever next edits this banner.
+            # Quoted 'EOF' (no expansion), dynamic line printed separately —
+            # an unquoted heredoc here would be an injection surface.
             printf '%s\n' "$_motd_border" >> /etc/motd
             cat << 'EOF' >> /etc/motd
                               NOTICE TO USERS
@@ -3197,21 +2894,11 @@ EOF
             if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
                 echo "[DRY-RUN] remove TUBSS-managed block from /etc/motd"
             else
-                # Find the unique line, then walk outward to the nearest
-                # border line above and below (the banner's own top/bottom
-                # asterisk rule) and drop that whole inclusive range, plus
-                # one blank separator line immediately before it if we
-                # added one on append.
-                #
-                # If either border can't be found (an admin trimmed the
-                # asterisk rules but left the text, for instance), the walk
-                # would otherwise run all the way to the start/end of the
-                # file and delete everything above or below the notice —
-                # confirmed by testing. Guard explicitly: only delete when
-                # BOTH borders actually matched; otherwise print the file
-                # unchanged and exit 1 so the caller can tell the two cases
-                # apart and warn instead of silently doing nothing (or
-                # everything).
+                # Walk outward from the unique line to the nearest border
+                # above and below and drop that inclusive range plus any blank
+                # separator. Only delete when BOTH borders matched — otherwise
+                # the walk runs to the start/end of file and takes unrelated
+                # content with it; exit 1 instead so the caller can warn.
                 local _staged
                 if ! _staged=$(mktemp); then
                     echo -e "  ${YELLOW}[WARN]${NC} Could not create a temp file — leaving /etc/motd unchanged."
@@ -3220,15 +2907,10 @@ EOF
                     { lines[++n] = $0 }
                     $0 == uniq { uniq_line = NR }
                     END {
-                        # exit 1 (not 0) here: the caller only reaches this
-                        # awk at all because `grep -qF` (a SUBSTRING match)
-                        # already found the unique line somewhere in the
-                        # file. If this EXACT-line match then finds nothing
-                        # (e.g. trailing whitespace differs), that is a
-                        # mismatch worth reporting, not a silent no-op --
-                        # exiting 0 here previously let the caller print a
-                        # false "[OK] Removed" while the banner was still
-                        # in the file, unchanged.
+                        # exit 1, not 0: the caller got here via a substring
+                        # grep, so an exact-line miss (trailing whitespace,
+                        # say) is a mismatch worth reporting rather than a
+                        # silent no-op reported as "[OK] Removed".
                         if (uniq_line == 0) { for (i = 1; i <= n; i++) print lines[i]; exit 1 }
                         start = uniq_line
                         while (start > 1 && lines[start] != border) start--
@@ -3250,13 +2932,9 @@ EOF
                     echo -e "  ${YELLOW}[WARN]${NC} /etc/motd looked like it had TUBSS's banner but the exact text/border lines couldn't be pinned down — leaving /etc/motd unchanged rather than risk deleting unrelated content. Remove the block by hand if needed."
                     rm -f "$_staged"
                 else
-                    # install -m instead of relying on mktemp's mode (0600)
-                    # surviving the mv — it doesn't: mv preserves the
-                    # source's mode, which silently dropped /etc/motd from
-                    # 644 to 600 (unreadable by non-root at login) before
-                    # this fix. Staged in /etc/ (same filesystem as the
-                    # destination) for a true atomic rename, matching
-                    # _install_sudoers_file's established pattern.
+                    # install -m, because mv preserves mktemp's 0600 and would
+                    # leave /etc/motd unreadable at login. Staged in /etc/ (same
+                    # filesystem) for an atomic rename, as _install_sudoers_file does.
                     if install -m 0644 "$_staged" /etc/motd.tubss-new 2>/dev/null && mv -f /etc/motd.tubss-new /etc/motd 2>/dev/null; then
                         echo -e "  ${YELLOW}[OK]${NC} Removed login banner (not requested this run)."
                         rm -f "$_staged"
@@ -3283,10 +2961,17 @@ disable_telemetry() {
             if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
                 echo ""
                 echo "[DRY-RUN] sed -i 's/^enable = true/enable = false/' /etc/ubuntu-report/ubuntu-report.conf"
+                echo -e "${GREEN}[OK]${NC} Ubuntu telemetry disabled."
             else
                 sed -i 's/^enable = true/enable = false/' /etc/ubuntu-report/ubuntu-report.conf
+                # sed exits 0 whether or not the pattern matched — verify before
+                # claiming success.
+                if grep -q '^enable = false' /etc/ubuntu-report/ubuntu-report.conf 2>/dev/null; then
+                    echo -e "${GREEN}[OK]${NC} Ubuntu telemetry disabled."
+                else
+                    echo -e "  ${YELLOW}[WARN]${NC} Could not find 'enable = true' in ubuntu-report.conf — telemetry was NOT confirmed disabled. Check the file by hand."
+                fi
             fi
-            echo -e "${GREEN}[OK]${NC} Ubuntu telemetry disabled."
         else
             echo -e "${YELLOW}Warning: Ubuntu telemetry configuration file not found. Skipping.${NC}"
         fi
@@ -3295,29 +2980,17 @@ disable_telemetry() {
     fi
 }
 
-# --- Clock/NTP preflight (originally CC-175 audit fix 1 for the AD join,
-#     now unconditional) ---
+# --- Clock/NTP preflight (unconditional) ---
 #
-# Accurate system time matters for any hardened server: TLS certificate
-# validation, log/audit timestamp accuracy, cron reliability — and, if this
-# run also joins an AD domain, Kerberos specifically rejects any ticket
-# request from a client whose clock is more than 5 minutes off (the classic
-# KRB5KRB_AP_ERR_SKEW failure on a freshly imaged VM with a drifted RTC).
-# chrony is installed unconditionally in install_packages() and started
-# early there so it has as much wall-clock time as possible to converge in
-# the background; this function just confirms it (or gets it running if the
-# early start was skipped, e.g. under dry-run) before continuing.
-#
-# This is diagnostic, not a gate: every failure path here warns and returns 0
-# so the rest of the run is never blocked on clock sync.
+# Accurate time matters for TLS validation, log timestamps, and cron; Kerberos
+# additionally rejects tickets from a client more than 5 minutes off
+# (KRB5KRB_AP_ERR_SKEW). chrony is installed and started early in
+# install_packages(); this just confirms it, or starts it if that was skipped.
+# Diagnostic, not a gate — every failure path warns and returns 0.
 ensure_time_sync() {
-    # max_wait is a wall-clock deadline (via $SECONDS), not an iteration
-    # count — a wedged probe below could otherwise blow past 30s even with
-    # `timeout` wrapping each call individually. Every probe is also
-    # individually `timeout`-bounded: a hung dbus/systemd-timedated or a
-    # wedged chronyd socket must not be able to stall an unattended run
-    # indefinitely, which would defeat the entire point of this being a
-    # bounded, non-blocking preflight.
+    # max_wait is a wall-clock deadline (via $SECONDS), not an iteration count,
+    # and every probe is individually `timeout`-bounded — a hung
+    # systemd-timedated or wedged chronyd socket must not stall the run.
     local max_wait=30 svc="" candidate tracking deadline
     deadline=$(( SECONDS + max_wait ))
     # Only the AD join specifically needs Kerberos-accurate time; mention it
@@ -3378,7 +3051,7 @@ ensure_time_sync() {
     return 0
 }
 
-# --- Post-join access control (CC-175 follow-up) ---
+# --- Post-join access control ---
 #
 # `realm join` on its own leaves realmd at PERMIT-ALL: every domain account
 # can already log in. TUBSS re-states that scope explicitly from the operator's
@@ -3393,19 +3066,16 @@ apply_realm_permit() {
     local -a permit_cmd=()
     local desc="" display=""
 
-    # Validated here — the actual trust boundary — regardless of whether
-    # AD_PERMIT_GROUP/AD_PERMIT_USERS came from an interactive prompt (which
-    # already validates) or a pre-seeded environment variable in unattended
-    # mode (which may not have). See _is_safe_ad_identifier()'s header for
-    # why this matters.
+    # Validated here — the actual trust boundary — since these values may have
+    # arrived pre-seeded from the environment rather than a validated prompt.
     if [[ "$mode" == "g" ]] && ! _is_safe_ad_identifier "${AD_PERMIT_GROUP:-}"; then
         AD_PERMIT_STATUS="Failed (invalid group name)"
         echo -e "  ${RED}[ERROR]${NC} AD_PERMIT_GROUP contains characters that are not safe to use here — refusing to run 'realm permit'."
         return 0
     fi
-    if [[ "$mode" == "u" ]] && ! _is_safe_ad_identifier "${AD_PERMIT_USERS:-}"; then
+    if [[ "$mode" == "u" ]] && { ! _is_safe_ad_identifier "${AD_PERMIT_USERS:-}" || _has_flaglike_token "${AD_PERMIT_USERS:-}"; }; then
         AD_PERMIT_STATUS="Failed (invalid username)"
-        echo -e "  ${RED}[ERROR]${NC} AD_PERMIT_USERS contains characters that are not safe to use here — refusing to run 'realm permit'."
+        echo -e "  ${RED}[ERROR]${NC} AD_PERMIT_USERS contains characters, or a username starting with '-', that are not safe to use here — refusing to run 'realm permit'."
         return 0
     fi
 
@@ -3417,9 +3087,12 @@ apply_realm_permit() {
             ;;
         u)
             # Deliberately unquoted: AD_PERMIT_USERS holds a space-separated
-            # list and `realm permit` takes one argument per username.
+            # list and `realm permit` takes one argument per username. `--`
+            # is a second line of defense so a token starting with '-' is
+            # read as a username, not a flag, even if the checks above
+            # somehow let one through.
             # shellcheck disable=SC2206
-            permit_cmd=(realm permit $AD_PERMIT_USERS)
+            permit_cmd=(realm permit -- $AD_PERMIT_USERS)
             desc="user(s) '${AD_PERMIT_USERS}'"
             display="realm permit ${AD_PERMIT_USERS}"
             ;;
@@ -3453,17 +3126,11 @@ apply_realm_permit() {
 # to that directory unvalidated. sudo also ignores any file there that is not
 # mode 0440, hence the explicit install mode.
 #
-# SECURITY: `visudo -cf` validates SYNTAX, not intent — it happily accepts a
-# line like `attacker ALL=(ALL) NOPASSWD:ALL # <the rest of our own line>`,
-# because '#' starts a sudoers comment and everything after it (including
-# text this function appended) is simply ignored. Confirmed exploitable: if
-# $content is ever built from an unvalidated value containing '#' or a
-# newline, an attacker-controlled rule can ride along past validation and
-# get installed at 0440 as root. Callers should already validate their
-# input (see _is_safe_ad_identifier), but this check exists here too,
-# unconditionally, because this is the actual trust boundary — the one
-# place any future caller's untrusted content is guaranteed to pass through
-# before touching /etc/sudoers.d/.
+# SECURITY: `visudo -cf` validates syntax, not intent. A '#' or newline in
+# $content lets an attacker-controlled rule ride past validation and get
+# installed at 0440 as root, because everything after '#' is a comment. Callers
+# validate their own input, but the check is repeated here unconditionally —
+# this is the one path all content takes before /etc/sudoers.d/.
 #
 # Returns 0 only when the snippet is installed (or announced under dry-run).
 _install_sudoers_file() {
@@ -3489,7 +3156,7 @@ _install_sudoers_file() {
         echo -e "  ${YELLOW}[WARN]${NC} Could not create a temp file — skipping ${dest}."
         return 1
     fi
-    printf '# TUBSS AD sudo grant (CC-175) — managed file, regenerate via tubss_setup.sh\n%s\n' \
+    printf '# TUBSS AD sudo grant — managed file, regenerate via tubss_setup.sh\n%s\n' \
         "$content" > "$tmp"
 
     if ! visudo -cf "$tmp" > /dev/null 2>&1; then
@@ -3499,13 +3166,10 @@ _install_sudoers_file() {
         return 1
     fi
 
-    # Stage in the destination directory (same filesystem as $dest, required
-    # for `mv` to be a single atomic rename(2)) rather than `install`ing
-    # straight over an existing file — install's overwrite is unlink+create+
-    # copy+chmod, not atomic, so a crash mid-copy could leave a truncated,
-    # root-owned 0440 file that sudo refuses to parse, breaking sudo on a
-    # headless box with no easy recovery: the exact failure this function
-    # exists to prevent.
+    # Stage in the destination directory (same filesystem, so `mv` is a single
+    # atomic rename) instead of installing over the live file: install's
+    # overwrite isn't atomic, and a crash mid-copy leaves a truncated sudoers
+    # file that breaks sudo entirely.
     local staged="${dest}.tubss-new"
     if install -m 0440 "$tmp" "$staged" 2>/dev/null && mv -f "$staged" "$dest" 2>/dev/null; then
         rm -f "$tmp"
@@ -3517,18 +3181,11 @@ _install_sudoers_file() {
     return 1
 }
 
-# Post-join identity verification. `realm join` succeeding only means
-# realmd's own handshake worked — it doesn't confirm NSS/sssd can actually
-# resolve a real identity, which is the thing that determines whether
-# anyone can really log in. `id` is the standard hand-check any admin runs
-# next; do it automatically so a broken NSS chain shows up immediately
-# instead of on someone's first failed login attempt.
-#
-# Tries the bare username first, then user@domain — sssd's
-# use_fully_qualified_names setting varies by config, so which form
-# resolves depends on the domain. Warn-only and never touches
-# AD_JOIN_STATUS: sssd can take a moment to warm up right after a join, so
-# a failure here is informational, not proof the join itself is broken.
+# Post-join identity verification. A successful `realm join` only means
+# realmd's handshake worked, not that NSS/sssd can resolve an identity — so run
+# the `id` check automatically instead of waiting for a failed login. Tries the
+# bare username then user@domain, since use_fully_qualified_names varies.
+# Warn-only: sssd can take a moment to warm up right after a join.
 _verify_ad_identity() {
     local user="$1" label="$2" domain="$3" out
     if out=$(id "$user" 2>&1); then
@@ -3545,56 +3202,28 @@ _verify_ad_identity() {
     return 1
 }
 
-# sssd's AD provider defaults use_fully_qualified_names=True, so `id julius`
-# fails to resolve and only `id julius@domain` works — confirmed on a real
-# join. That's sssd's collision-avoidance default for trusted-domain setups
-# (it wants "julius" from domain A distinguishable from "julius" from a
-# trusted domain B), but for a single-domain join it just means every login,
-# `id` check, and sudoers entry has to use the qualified form for no benefit
-# — confusing for anyone used to plain usernames, and exactly what tripped
-# up the sudoers-extra-user prompt above. Flip it to bare-username mode by
-# editing sssd.conf directly (realmd/adcli have no join-time flag for this)
-# and restart sssd so it takes effect within the same run — including for
-# _verify_ad_identity() right after. Also aligns fallback_homedir so a bare
-# login name doesn't land in a domain-suffixed home directory.
+# sssd's AD provider defaults to use_fully_qualified_names=True, so only
+# `id user@domain` resolves. That's collision-avoidance for multi-domain trust
+# setups; for a single-domain join it just forces the qualified form into every
+# login, `id` check, and sudoers entry. Flip it by editing sssd.conf directly
+# (realmd/adcli expose no join-time flag) and restart sssd so it applies within
+# this run. fallback_homedir is aligned so bare logins don't get a
+# domain-suffixed home.
 #
-# TRADEOFF: if this box ever joins a SECOND, trusted AD domain later, a
-# same-named account in the other domain becomes ambiguous. Homelab/office
-# single-domain joins (what TUBSS targets) don't hit this; documented here
-# so it's a deliberate choice, not a silent one.
+# TRADEOFF: if this box later joins a second, trusted domain, same-named
+# accounts become ambiguous. Single-domain joins (TUBSS's target) don't hit it.
 #
-# 2026-08-10 review of other realmd/sssd settings TUBSS could expose or
-# tune, requested after the qualified-names issue above:
-#   - default_shell: realmd/adcli already default this to /bin/bash on
-#     join, which is correct for every OS TUBSS targets. No action needed.
-#   - ldap_id_mapping (True by default): sssd computes UIDs/GIDs locally
-#     from the AD SID instead of trusting POSIX attributes from AD. Correct
-#     default unless the AD schema has real RFC2307 POSIX attributes
-#     configured — TUBSS has no way to detect that from the client side, so
-#     leaving the default alone is the safe choice; a wrong guess here
-#     silently reassigns every domain user's UID/GID.
-#   - cache_credentials / krb5_store_password_if_offline (True by default):
-#     enables offline login using cached credentials when the DC is
-#     unreachable — exactly what a laptop/homelab join wants. Already on by
-#     realmd's default; no TUBSS action needed.
-#   - ad_gpo_access_control / ad_access_filter: deeper Group-Policy-based
-#     login restriction than the realm-permit scope TUBSS already
-#     implements. Explicitly NOT added — it depends entirely on the
-#     specific GPOs configured in each AD environment, which TUBSS can't
-#     see or test against; a wrong filter here silently locks everyone out.
-#     The existing `realm permit` scope (all/group/users, set via
-#     AD_PERMIT_MODE) is the portable mechanism this tool commits to.
+# Everything else is left at realmd's defaults on purpose — notably
+# ldap_id_mapping (a wrong guess silently reassigns every UID/GID) and
+# ad_gpo_access_control/ad_access_filter (GPO-dependent, untestable from here).
 _configure_sssd_login_format() {
     local domain="$1"
     local sssd_conf="/etc/sssd/sssd.conf"
 
-    # Warn-and-continue, same convention as every other AD sub-step in this
-    # file (always returns 0; caller is bare/unguarded under set -e). A
-    # `return 1` here previously aborted the ENTIRE run right after a
-    # successful join — apply_realm_permit, install_ad_sudoers,
-    # _verify_ad_identity, and the AD_PASSWORD scrub never ran, leaving a
-    # box joined to AD with no one permitted to log in and no sudo grant.
-    # Confirmed by direct reproduction before this fix.
+    # Warn-and-continue (always returns 0), like every other AD sub-step: the
+    # caller is unguarded under set -e, so a non-zero return would abort the
+    # run right after a successful join, skipping permit, sudoers, identity
+    # verification, and the AD_PASSWORD scrub.
     if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
         echo "[DRY-RUN] set use_fully_qualified_names = False, fallback_homedir = /home/%u in ${sssd_conf}"
         echo "[DRY-RUN] systemctl restart sssd"
@@ -3607,22 +3236,11 @@ _configure_sssd_login_format() {
     fi
 
     # Read the section name from the live file rather than constructing
-    # "[domain/${domain}]" ourselves — realmd's casing/formatting of the
-    # domain in sssd.conf isn't guaranteed to byte-match whatever case the
-    # operator typed at the AD_DOMAIN prompt. Trimmed of trailing
-    # whitespace so a section header like "[domain/joka.ca] " (trailing
-    # space) still matches literal `$0 == section` comparisons in the awk
-    # below — otherwise the section is silently never found, the file is
-    # rewritten unchanged, and this would have claimed success anyway.
-    # `|| true`: under set -o pipefail, grep finding nothing exits 1 and
-    # that becomes this assignment's exit status — a bare assignment
-    # statement propagates a non-zero status straight to set -e, silently
-    # killing the entire run right here (no ERR trap fires for this,
-    # since the trap isn't set with `set -E`/errtrace to fire inside
-    # functions) before the `[[ -z "$section" ]]` handler two lines down
-    # — written specifically to handle this case — ever runs. Confirmed
-    # by direct reproduction against a [sssd]-only sssd.conf with no
-    # [domain/...] section (realistic: realmd using a conf.d drop-in).
+    # "[domain/${domain}]": realmd's casing may not match what the operator
+    # typed. Trailing whitespace is trimmed so the literal `$0 == section`
+    # comparison in the awk below still matches. `|| true` because under
+    # pipefail a no-match grep would propagate non-zero straight to set -e and
+    # kill the run before the `[[ -z "$section" ]]` handler below can report it.
     local section
     section=$(grep -oE '^\[domain/[^]]+\]' "$sssd_conf" | head -1 | sed 's/[[:space:]]*$//') || true
     if [[ -z "$section" ]]; then
@@ -3643,9 +3261,8 @@ _configure_sssd_login_format() {
         return 0
     fi
 
-    # `if ! awk ...` (not a bare statement) so a genuine awk failure is
-    # caught here instead of firing the ERR trap under set -e — same class
-    # of bug as the return-1 issue above, just one line lower.
+    # `if ! awk ...` rather than a bare statement, so a genuine awk failure is
+    # handled here instead of firing the ERR trap under set -e.
     if ! awk -v section="$section" '
         BEGIN { in_section = 0; done_uqn = 0; done_home = 0 }
         function flush_missing() {
@@ -3723,13 +3340,9 @@ _configure_sssd_login_format() {
 install_ad_sudoers() {
     local -a granted=()
 
-    # Idempotency: a re-run where the operator answers "no" (or blanks the
-    # extra-user field) must actually revoke a grant made by an earlier run,
-    # not just skip re-installing it — these two files are the ONLY state
-    # this feature owns, so remove whichever one no longer applies BEFORE
-    # conditionally reinstalling. Without this, an operator who re-runs
-    # TUBSS to walk back a sudo grant would believe they'd revoked it while
-    # the old /etc/sudoers.d file quietly kept granting it.
+    # Idempotency: a re-run answering "no" must actually revoke an earlier
+    # grant, not just skip reinstalling it. These two files are the only state
+    # this feature owns, so remove whichever no longer applies first.
     if [[ ! "${AD_GRANT_ADMINS_SUDO:-no}" =~ ^([yY][eE][sS]|[yY])$ ]] && [[ -e /etc/sudoers.d/tubss-ad-admins ]]; then
         if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
             echo "[DRY-RUN] rm -f /etc/sudoers.d/tubss-ad-admins"
@@ -3754,13 +3367,10 @@ install_ad_sudoers() {
     fi
 
     if [[ -n "${AD_SUDO_EXTRA_USER:-}" ]]; then
-        # Validated here too (not just inside _install_sudoers_file) so the
-        # operator gets a specific, actionable message rather than the
-        # generic newline/'#' refusal — see _is_safe_sudo_username's header.
-        # Specifically _is_safe_sudo_username, not the more permissive
-        # _is_safe_ad_identifier: this value becomes the User_List of a
-        # sudoers rule, where the bare word "ALL" means "every account" —
-        # a plain identifier check alone does not catch that.
+        # Validated here too, for a specific message instead of the generic
+        # refusal. Uses _is_safe_sudo_username, not the more permissive
+        # _is_safe_ad_identifier: this becomes a sudoers User_List, where the
+        # bare word "ALL" would mean every account.
         if ! _is_safe_sudo_username "$AD_SUDO_EXTRA_USER"; then
             echo -e "  ${RED}[ERROR]${NC} AD_SUDO_EXTRA_USER ('${AD_SUDO_EXTRA_USER}') is not a safe single username (unsafe characters, a space, or the reserved word 'ALL') — sudo grant skipped."
         elif _install_sudoers_file "/etc/sudoers.d/tubss-ad-extra-sudo" "${AD_SUDO_EXTRA_USER} ALL=(ALL:ALL) ALL"; then
@@ -3773,10 +3383,8 @@ install_ad_sudoers() {
         if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
             AD_SUDO_STATUS="${AD_SUDO_STATUS} (dry-run)"
         else
-            # _install_sudoers_file's own [OK] line is the technical
-            # confirmation (file path, mode) for the log; this is the plain
-            # answer to what someone reading the terminal actually wants to
-            # know — can I sudo now.
+            # _install_sudoers_file logs the file path and mode; this is the
+            # plain-language answer to "can I sudo now".
             local who
             for who in "${granted[@]}"; do
                 echo -e "  ${GREEN}[OK]${NC} '${who}' can now use sudo on this machine."
@@ -3790,7 +3398,7 @@ install_ad_sudoers() {
     return 0
 }
 
-# --- AD Domain Join (CC-175) ---
+# --- AD Domain Join ---
 #
 # Credential handling rules — do not relax:
 #   * AD_PASSWORD reaches `realm` on stdin ONLY. Never in argv (world-readable
@@ -3799,9 +3407,9 @@ install_ad_sudoers() {
 #   * realm's own output is captured, never streamed, and is redacted before
 #     printing — everything printed here goes through the tee'd log.
 #
-# Failure policy matches the CC-131/CC-133 apt-upgrade step: warn and
-# continue, never abort. A hardened box that failed its domain join beats an
-# aborted run that configured nothing. The outcome lands in AD_JOIN_STATUS.
+# Failure policy matches the apt-upgrade step: warn and continue, never abort.
+# A hardened box that failed its domain join beats an aborted run that
+# configured nothing. The outcome lands in AD_JOIN_STATUS.
 #
 # Always returns 0 so the ERR trap never fires on a join failure.
 perform_realm_join() {
@@ -3815,11 +3423,9 @@ perform_realm_join() {
         return 0
     fi
 
-    # Validated here too (not just at the interactive prompt) — the actual
-    # trust boundary, since AD_DOMAIN/AD_USER may have been pre-seeded via
-    # environment in unattended mode instead of prompted for. A value
-    # starting with '-' would otherwise pass straight through as an
-    # unintended flag to `realm discover`/`realm join`.
+    # Validated here too — the actual trust boundary, since these may have been
+    # pre-seeded rather than prompted. A value starting with '-' would
+    # otherwise reach `realm discover`/`realm join` as a flag.
     if ! _is_safe_ad_identifier "$domain" || ! _is_safe_ad_identifier "$user"; then
         AD_JOIN_STATUS="Failed (invalid domain or username)"
         echo -e "${RED}[ERROR]${NC} AD_DOMAIN or AD_USER contains characters that are not safe to pass to 'realm' — skipping AD join."
@@ -3837,12 +3443,9 @@ perform_realm_join() {
     # of the run as possible to converge. Never blocks the join.
     ensure_time_sync
 
-    # Preflight: discovery proves the DNS SRV records resolve and the domain
-    # controllers are reachable before we touch the existing join or hand
-    # realmd a credential. Must run BEFORE the leave below — leaving the old
-    # domain first and only then finding the new one unreachable would strand
-    # the box joined to neither (auth outage for every domain user, with the
-    # old computer object already gone locally).
+    # Discovery proves DNS SRV records resolve and the DCs are reachable before
+    # touching the existing join. Must run before the leave below: leaving first
+    # and then finding the new domain unreachable strands the box joined to neither.
     if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
         echo "[DRY-RUN] realm discover ${domain}"
     elif realm discover "$domain" > /dev/null 2>&1; then
@@ -3851,14 +3454,10 @@ perform_realm_join() {
         AD_JOIN_STATUS="Failed (discovery)"
         echo -e "${YELLOW}[WARN]${NC} Could not discover domain '${domain}' — DNS or network unreachable."
         echo -e "${YELLOW}[WARN]${NC} Skipping the join. Investigate with: sudo realm discover ${domain}"
-        # CC-175 audit fix 2: join_ad_domain runs BEFORE configure_network on
-        # purpose — network config is last because `netplan try` auto-reverts
-        # on SSH loss, and a broken join must not stop earlier steps from
-        # landing. The side effect is that a new DNS server chosen in this
-        # same run is not active yet, so discovery can fail for a reason that
-        # resolves itself on reboot. Say so instead of leaving the operator to
-        # debug a non-problem. Only fires when a static DNS server was
-        # actually configured — DHCP runs get the generic warning above.
+        # The join deliberately runs before configure_network, so a new DNS
+        # server chosen in this same run isn't live yet and discovery can fail
+        # for a reason that resolves itself on reboot. Say so rather than let
+        # the operator debug a non-problem. Static-DNS runs only.
         if [[ "${NET_TYPE:-}" == "static" && -n "${DNS_SERVER:-}" ]]; then
             echo -e "${YELLOW}[NOTE]${NC} This run is also changing this host's network/DNS configuration (new DNS server: ${DNS_SERVER})."
             echo -e "${YELLOW}[NOTE]${NC} That change is applied AFTER this join attempt and is not live until 'netplan try' succeeds or the box reboots."
@@ -3908,22 +3507,17 @@ perform_realm_join() {
             | realm join --user="$user" "$domain" 2>&1); then
         AD_JOIN_STATUS="Joined (${domain})"
         echo -e "${GREEN}[OK]${NC} Joined Active Directory domain '${domain}'."
-        # CC-175 audit fix 3: sssd authenticates domain users but creates no
-        # home directory, so a first login lands in a non-existent $HOME.
-        # pam_mkhomedir ships with libpam-modules (present on every Debian and
-        # Ubuntu install); pam-auth-update is the supported non-interactive
-        # way to switch its PAM profile on. Warn-only — a joined box with no
-        # auto-created homes is still a joined box.
+        # sssd authenticates domain users but creates no home directory, so a
+        # first login lands in a non-existent $HOME. pam-auth-update is the
+        # supported non-interactive way to enable pam_mkhomedir. Warn-only.
         if pam-auth-update --enable mkhomedir > /dev/null 2>&1; then
             echo -e "  ${GREEN}[OK]${NC} Home-directory creation on first login enabled (pam_mkhomedir)."
         else
             echo -e "  ${YELLOW}[WARN]${NC} Could not enable pam_mkhomedir — domain users may log in without a home directory."
             echo -e "  ${YELLOW}[WARN]${NC} Enable it manually with: sudo pam-auth-update --enable mkhomedir"
         fi
-        # Bare-username logins (see _configure_sssd_login_format's header) —
-        # opt-out, default yes (AD_BARE_USERNAMES). Runs before permit/
-        # sudoers/identity-check below so all of them see the final, real
-        # login-name format for this run.
+        # Bare-username logins (see _configure_sssd_login_format). Runs before
+        # permit/sudoers/identity-check so they all see the final name format.
         if [[ "${AD_BARE_USERNAMES:-yes}" =~ ^([yY][eE][sS]|[yY])$ ]]; then
             _configure_sssd_login_format "$domain"
         else
@@ -3933,22 +3527,12 @@ perform_realm_join() {
         # neither can downgrade AD_JOIN_STATUS — the join itself succeeded.
         apply_realm_permit
         install_ad_sudoers
-        # Confirm the join account itself resolves via NSS, and — if a
-        # specific named user (not just the Domain Admins group) was
-        # granted sudo — confirm that identity too. A named sudo grant
-        # usually means this box is being set up FOR that person (e.g. a
-        # workstation/laptop-style single-user setup), so their identity
-        # actually resolving is the real end-to-end proof that matters.
-        #
-        # The join-account check specifically drives AD_IDENTITY_STATUS: it
-        # is the account that JUST authenticated successfully, so if NSS
-        # can't resolve it right after, that's a real signal something in
-        # the NSS/sssd chain is broken — not a "maybe this particular
-        # account doesn't exist" ambiguity the sudo-user check can have.
-        # This is deliberately louder than a plain [WARN]: AD_JOIN_STATUS
-        # alone would still say "Joined" here, which is technically true
-        # (realmd's handshake worked) but misleading about whether anyone
-        # can actually use the box.
+        # Confirm the join account resolves via NSS, plus any named sudo user
+        # (that box is usually being set up for that person). The join account
+        # drives AD_IDENTITY_STATUS because it just authenticated successfully,
+        # so an NSS miss is unambiguously a broken chain rather than a
+        # nonexistent account. Louder than a [WARN] since AD_JOIN_STATUS would
+        # still read "Joined" while nobody can actually use the box.
         if _verify_ad_identity "$user" "join account" "$domain"; then
             AD_IDENTITY_STATUS="Verified"
         else
@@ -3957,23 +3541,20 @@ perform_realm_join() {
             echo -e "  ${RED}[ERROR]${NC} This usually means domain logins will NOT work despite 'Joined' above."
             echo -e "  ${RED}[ERROR]${NC} Check: systemctl status sssd ; journalctl -u sssd -n 50 ; getent passwd ${user}"
         fi
-        # Comma-delimited exact match, not a bare substring check: AD_SUDO_STATUS
-        # is a literal comma-joined list (e.g. "Domain Admins,jsmith"), and a
-        # plain *"$AD_SUDO_EXTRA_USER"* would false-positive on any username
-        # that happens to be a substring of "Domain Admins" (e.g. "main",
-        # "Admins") or of a failure string like "Failed (none installed)"
-        # (e.g. "none", "install").
+        # Comma-delimited exact match: AD_SUDO_STATUS is a comma-joined list,
+        # and a bare substring test would false-positive on usernames contained
+        # in "Domain Admins" or in a failure string.
         if [[ -n "${AD_SUDO_EXTRA_USER:-}" ]] && [[ ",${AD_SUDO_STATUS}," == *",${AD_SUDO_EXTRA_USER},"* ]]; then
-            _verify_ad_identity "$AD_SUDO_EXTRA_USER" "sudo user" "$domain"
+            # Guarded: _verify_ad_identity legitimately returns 1 right after a
+            # join while sssd is still warming up, which must not abort the run.
+            _verify_ad_identity "$AD_SUDO_EXTRA_USER" "sudo user" "$domain" || true
         fi
     else
         AD_JOIN_STATUS="Failed (see error above)"
         echo -e "${RED}[ERROR]${NC} Failed to join '${domain}' — continuing with TUBSS hardening."
-        # Redact the credential before echoing realmd's diagnostics to the log.
-        # AD_PASSWORD is quoted inside the pattern so glob metacharacters
-        # (*, ?, [) in the password are matched literally instead of as a
-        # glob — an unquoted pattern would silently fail to redact a
-        # password containing an unterminated "[" and leak it into the log.
+        # Redact the credential before logging realmd's diagnostics. AD_PASSWORD
+        # is quoted inside the pattern so glob metacharacters in the password
+        # match literally; unquoted, a password containing "[" would leak.
         printf '%s\n' "${realm_output//"$AD_PASSWORD"/[REDACTED]}"
         echo -e "${RED}[ERROR]${NC} Retry manually with: sudo realm join --user=${user} ${domain}"
     fi
@@ -3993,9 +3574,8 @@ join_ad_domain() {
         AD_IDENTITY_STATUS="Skipped"
         echo -e "${YELLOW}[SKIPPED]${NC} AD domain join."
     fi
-    # A join that never got as far as the permit/sudo/identity-check steps
-    # configured/verified none of them. Say so, instead of leaving the
-    # summary showing the intent (or "pending") as though it had landed.
+    # A join that never reached the permit/sudo/identity steps configured none
+    # of them — say so rather than leave the summary showing the intent.
     if [[ "$AD_PERMIT_STATUS" == "pending" ]]; then
         AD_PERMIT_STATUS="Not applied (join failed)"
     fi
@@ -4010,10 +3590,8 @@ join_ad_domain() {
 
 # --- Step 5: Final Summary and Reboot Prompt ---
 reboot_prompt() {
-    # CC-104 Fix C: finalize state depending on whether a reboot is pending.
-    # If netplan apply is deferred (NETPLAN_APPLY_PENDING=1), mark the state
-    # file as "pending_reboot" instead of "completed" so the next TUBSS run
-    # knows the box is not yet in the declared state.
+    # With netplan apply deferred, mark the state file "pending_reboot" rather
+    # than "completed" so the next run knows the box isn't in the declared state.
     if (( NETPLAN_APPLY_PENDING == 1 )); then
         finalize_run_state "pending_reboot"
     else
@@ -4026,16 +3604,9 @@ reboot_prompt() {
     echo ""
 
     # Write summary to file
-    # Reuses display_config_summary() (the interactive table) instead of a
-    # second, hand-maintained copy of the same rows. The two had drifted:
-    # the old hand-typed version here was missing the NET_TYPE==static
-    # guard (so DHCP boxes got a garbage "127.0.0.1" IP row), had
-    # hand-spaced padding that didn't adapt to real value lengths, and
-    # was missing settings (e.g. no Auto Reboot row at all) that the
-    # interactive table already had right. One source of truth for both
-    # display surfaces means they can't drift apart again. Colors are
-    # blanked for this call only (subshell) since ANSI codes don't belong
-    # in a plain text file.
+    # Reuses display_config_summary() rather than a second hand-maintained copy
+    # of the same rows, which had drifted. Colors are blanked for this call
+    # only (subshell) since ANSI codes don't belong in a plain text file.
     cat << EOF > "$SUMMARY_FILE"
 TUBSS - The Ubuntu/Debian Basic Setup Script - Configuration Summary
 Provided by Joka.ca
@@ -4057,16 +3628,10 @@ EOF
     echo -e "$SUMMARY_ART"
     display_config_summary
 
-    # Consolidated end-of-run issue summary. Most failures in this script
-    # are fatal under `set -e` — the run would have already stopped with
-    # its own clear error and never reached this point. What CAN survive to
-    # here are the steps deliberately built warn-and-continue (package
-    # upgrade, every AD sub-step, and SSH hardening as of CC-181): the run
-    # finishes, but something still needs a human to look at it, and that's
-    # easy to miss buried a few screens up in the log. Require
-    # acknowledgment in interactive mode so it can't just scroll by
-    # unnoticed; nothing to block on under --unattended, so just print it
-    # there.
+    # Consolidated end-of-run issue summary. Only the warn-and-continue steps
+    # (package upgrade, the AD sub-steps, SSH hardening) can reach here with a
+    # problem — everything else is fatal under `set -e`. Requires acknowledgment
+    # interactively so it can't scroll past unnoticed.
     local -a _run_issues=()
     [[ "$PACKAGE_UPDATES_STATUS" == Partial* ]] && _run_issues+=("Package Updates: ${PACKAGE_UPDATES_STATUS}")
     [[ "$AD_JOIN_STATUS" == Failed* ]] && _run_issues+=("AD Domain Join: ${AD_JOIN_STATUS}")
@@ -4094,9 +3659,8 @@ EOF
     echo ""
     echo -e "$CLOSING_ART"
 
-    # P0: if netplan try/apply was deferred, a reboot is mandatory to pick up
-    # the static config. Warn loudly and default to yes — decline still
-    # allowed but clearly marked as dangerous.
+    # A deferred netplan try/apply makes the reboot mandatory to pick up the
+    # static config. Warn loudly; declining is allowed but flagged.
     if (( NETPLAN_APPLY_PENDING == 1 )); then
         echo -e "${RED}!! A REBOOT IS REQUIRED !!${NC}"
         echo -e "${YELLOW}TUBSS could not apply the new network configuration live (netplan try/apply deferred).${NC}"
@@ -4137,7 +3701,7 @@ EOF
 # --- Feature 4: Rollback UI ---
 run_rollback_ui() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}[ERROR] Rollback requires root. Run with sudo.${NC}"
+        echo -e "${RED}[ERROR]${NC} Rollback requires root. Run with sudo."
         exit 1
     fi
 
@@ -4294,7 +3858,7 @@ run_rollback_ui() {
 
     echo ""
     echo -e "${YELLOW}[INFO]${NC} Reboot is required for the restore to take full effect."
-    prompt do_reboot "Would you like to reboot now? (yes/no) [no]: "
+    prompt do_reboot "Would you like to reboot the system now? (yes/no) [no]: "
     do_reboot=${do_reboot:-no}
     if [[ "$do_reboot" =~ ^([yY][eE][sS]|[yY])$ ]]; then
         if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
