@@ -14,6 +14,9 @@
 #==============================================================================
 
 set -euo pipefail
+# Never leave AD_PASSWORD (resident in this process's memory between the
+# prompt and its scrub) recoverable from a core dump.
+ulimit -c 0
 
 # --- Global Variables & Colors ---
 YELLOW='\033[1;33m'
@@ -2334,7 +2337,12 @@ configure_network() {
         if [[ ${TUBSS_DRY_RUN:-0} -eq 1 ]]; then
             echo "[DRY-RUN] write netplan static config to $network_config_file"
         else
-            cat << EOF > "$network_config_file"
+            # umask in a subshell so the file is created root-only from the
+            # first byte, rather than at default permissions and narrowed a
+            # moment later by the chmod below.
+            (
+                umask 077
+                cat << EOF > "$network_config_file"
 network:
   version: 2
   renderer: networkd
@@ -2348,7 +2356,9 @@ network:
       nameservers:
         addresses: [$DNS_SERVER]
 EOF
-            # Keep the static config root-only to match the rest of /etc/netplan.
+            )
+            # Belt-and-suspenders: keep it root-only even if the umask above
+            # didn't apply for some reason.
             chmod 600 "$network_config_file" 2>/dev/null || true
         fi
         # Apply immediately via `netplan try` (auto-reverts on SSH loss).
@@ -2443,7 +2453,14 @@ configure_ufw() {
             # to IPv4 instead.
             if [[ -f /etc/default/ufw ]] && ! ip6tables -L >/dev/null 2>&1; then
                 sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw
-                echo -e "  ${YELLOW}[WARN]${NC} ip6tables unusable on this kernel — UFW will manage IPv4 only."
+                # sed exits 0 whether or not the pattern matched — verify
+                # IPV6 actually ended up disabled before claiming it's safe
+                # to proceed; the commands below still touch v6 otherwise.
+                if grep -q '^IPV6=no' /etc/default/ufw 2>/dev/null; then
+                    echo -e "  ${YELLOW}[WARN]${NC} ip6tables unusable on this kernel — UFW will manage IPv4 only."
+                else
+                    echo -e "  ${YELLOW}[WARN]${NC} ip6tables unusable on this kernel, and IPV6 could not be confirmed disabled in /etc/default/ufw — UFW commands below may still fail. Edit /etc/default/ufw by hand (set IPV6=no) if so."
+                fi
             fi
             ufw default deny incoming
             ufw default allow outgoing
