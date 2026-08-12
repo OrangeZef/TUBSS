@@ -7,6 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Strip unnecessary systemd targets to speed boot
 RUN find /etc/systemd/system /lib/systemd/system -path '*.wants/*' \
     \( -name '*getty*' -o -name '*udev*' -o -name '*timer*' \) -exec rm -f {} + || true
+# Stub a realistic /etc/default/grub so configure_apparmor_debian()'s
+# sed+verify path actually executes in CI instead of hitting the
+# "GRUB config not found — skipping" early-return branch (minimal
+# containers don't have the grub package installed).
+RUN mkdir -p /etc/default && printf 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"\n' > /etc/default/grub
 COPY tubss_setup.sh /root/tubss_setup.sh
 COPY test/integration/run.sh /root/run.sh
 COPY test/integration/assertions.sh /root/assertions.sh

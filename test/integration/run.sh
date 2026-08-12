@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Integration test harness. Runs inside a systemd-enabled container.
-# Usage: run.sh [default|ssh-hardened|ssh-hardening-broken]
+# Usage: run.sh [default|ssh-hardened|ssh-hardening-broken|rerun]
 set -euo pipefail
 
 MODE=${1:-default}
@@ -13,6 +13,44 @@ mkdir -p /run/sshd && chmod 755 /run/sshd
 echo "=========================================="
 echo "TUBSS Integration Test — mode: $MODE"
 echo "=========================================="
+
+if [[ "$MODE" == "rerun" ]]; then
+    # Idempotency check: run TUBSS twice back-to-back with NO state cleanup
+    # between runs (every other mode here gets a clean /var/lib/tubss/last_run
+    # from integration.yml). This is the one scenario a wipe-between-runs
+    # harness structurally can't cover, and it's exactly what caught real
+    # bugs in review (btrfs snapshot creation breaking on a second run,
+    # display_prior_run_state() reading a real prior-run file for the first
+    # time anywhere in CI).
+    export TUBSS_UNATTENDED=1
+    export TUBSS_SKIP_REBOOT=1
+    if ! bash /root/tubss_setup.sh --unattended > /root/tubss-rerun-1.log 2>&1; then
+        echo "[FATAL] First run exited non-zero"
+        cat /root/tubss-rerun-1.log
+        exit 1
+    fi
+    sync || true
+    sleep 1
+    if ! bash /root/tubss_setup.sh --unattended > /root/tubss-rerun-2.log 2>&1; then
+        echo "[FATAL] Second run (same state, no cleanup) exited non-zero"
+        cat /root/tubss-rerun-2.log
+        exit 1
+    fi
+    sync || true
+    sleep 1
+
+    echo ""
+    echo "=========================================="
+    echo "Running assertions (mode: $MODE)"
+    echo "=========================================="
+    assert_file_exists /root/tubss-rerun-2.log
+    assert_file_contains /root/tubss-rerun-2.log 'Prior Run State'
+    assert_file_contains /root/tubss-rerun-2.log 'run ended rc=0'
+    assert_file_exists /var/lib/tubss/last_run
+    assert_file_contains /var/lib/tubss/last_run 'STATUS=completed'
+    summary
+    exit $?
+fi
 
 # Run the script with unattended + skip-reboot
 export TUBSS_UNATTENDED=1
@@ -87,6 +125,16 @@ assert_file_contains /var/log/tubss.log 'Applying pending package updates'
 assert_file_contains /var/log/tubss.log 'Package updates applied'
 assert_file_exists /var/lib/tubss/last_run
 assert_file_contains /var/lib/tubss/last_run 'STATUS=completed'
+# These files are stubbed into the Dockerfiles specifically so
+# configure_apparmor_debian()/disable_telemetry()'s sed+verify branches
+# actually execute here instead of hitting their "not found — skipping"
+# early return (minimal containers don't ship grub or ubuntu-report).
+if [[ -f /etc/default/grub ]]; then
+    assert_file_contains /etc/default/grub 'apparmor=1'
+fi
+if [[ -f /etc/ubuntu-report/ubuntu-report.conf ]]; then
+    assert_file_contains /etc/ubuntu-report/ubuntu-report.conf 'enable = false'
+fi
 # cloud-init drop-in is only written when /etc/cloud/cloud.cfg.d/ exists
 # (cloud-init installed). Minimal test containers typically lack it, so
 # only assert when the parent dir is present.

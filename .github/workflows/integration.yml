@@ -63,6 +63,20 @@ jobs:
       - name: Capture CC-181 regression run log
         if: always()
         run: docker exec tubss-${{ matrix.name }} cat /var/log/tubss.log || true
+      # Idempotency (rerun) mode tests script-level logic, not OS-specific
+      # behavior, so it only needs to run on one Ubuntu and one Debian target
+      # rather than doubling CI time across the whole matrix.
+      - name: Clean container state for rerun check
+        if: matrix.name == 'ubuntu-24.04' || matrix.name == 'debian-12'
+        run: docker exec tubss-${{ matrix.name }} bash -c "rm -f /var/log/tubss.log /var/lib/tubss/last_run"
+      - name: Run TUBSS (idempotency — same settings, no state cleanup between runs)
+        if: matrix.name == 'ubuntu-24.04' || matrix.name == 'debian-12'
+        run: docker exec tubss-${{ matrix.name }} /root/run.sh rerun
+      - name: Capture rerun logs
+        if: always() && (matrix.name == 'ubuntu-24.04' || matrix.name == 'debian-12')
+        run: |
+          docker exec tubss-${{ matrix.name }} cat /root/tubss-rerun-1.log || true
+          docker exec tubss-${{ matrix.name }} cat /root/tubss-rerun-2.log || true
       - name: Cleanup
         if: always()
         run: docker rm -f tubss-${{ matrix.name }} || true
